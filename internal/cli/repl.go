@@ -4,15 +4,27 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/Velmet44/argon/internal/tui"
+	"github.com/Velmet44/argon/internal/xcontext"
 )
 
-// runREPL is the fullscreen BubbleTea app. v0.0 scaffold prints guidance;
-// full viewport lands next iteration (SPEC 2.2/6.1 states already specced).
 func runREPL(cmd *cobra.Command) error {
 	if !isTTY() {
 		return fmt.Errorf("argon REPL needs a TTY — use: argon \"your task\" [--dry-run]")
 	}
-	fmt.Println("argon REPL (scaffold) — fullscreen TUI lands next.")
-	fmt.Println("Use: argon \"list big files\" --dry-run | argon settings | argon config list")
-	return nil
+	shell := cfg.Defaults.Shell
+	if shell == "" || shell == "auto" {
+		shell = xcontext.DetectShell()
+	}
+	ci := xcontext.Collect()
+	var hist []string
+	if cfg.Defaults.History {
+		limit := cfg.Defaults.HistoryLimit
+		if limit <= 0 {
+			limit = 50
+		}
+		hist = xcontext.ReadHistory(limit)
+	}
+	force, _ := cmd.Flags().GetBool("force")
+	return tui.RunREPL(cfg, ci.OS, shell, ci.CWD, ci.LsTop, hist, force)
 }
