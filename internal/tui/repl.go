@@ -74,6 +74,8 @@ type replModel struct {
 	raw       string
 	pending   string // command awaiting confirm
 	pendingWhy string
+	pendingDone bool
+	pendingMsg  string
 	sess      []sessTurn
 
 	inputHist []string
@@ -480,6 +482,7 @@ func setDryRun(m *replModel, on bool) {
 func (m *replModel) startPrompt(p string) {
 	m.prompt = p
 	m.turn = 0
+	m.pendingDone, m.pendingMsg = false, ""
 	m.lines = append(m.lines, styleHeader(m.cfg.UI.Color, "you: "+p))
 	m.startLLMTurn(m.buildUserCtx(p, ""))
 }
@@ -526,7 +529,7 @@ func (m *replModel) startLLMTurn(userCtx string) {
 	baseURL, model, key, preset := m.llmReq()
 	if key == "" {
 		m.lines = append(m.lines, styleErr(m.cfg.UI.Color,
-			fmt.Sprintf("no API key — set %s (or ARGON_API_KEY) or run `argon settings`", preset.KeyEnv)))
+			fmt.Sprintf("no API key — get a free Groq key at %s, then `argon settings` (or set %s)", llm.GroqKeyURL, preset.KeyEnv)))
 		m.m = modeInput
 		m.input.Focus()
 		return
@@ -622,18 +625,28 @@ func (m *replModel) handleLLMDone(raw string) {
 	if reply.Thought != "" {
 		m.lines = append(m.lines, styleArgon(m.cfg.UI.Color, reply.Thought))
 	}
-	if reply.Done || reply.Command == nil || strings.TrimSpace(*reply.Command) == "" {
+	if reply.Command == nil || strings.TrimSpace(*reply.Command) == "" {
 		m.lines = append(m.lines, reply.Message)
 		m.finishPrompt(nil, 0)
 		m.render()
 		return
 	}
+	doneFirst := reply.Done
+	m.pendingDone, m.pendingMsg = doneFirst, reply.Message
 	command := strings.TrimSpace(*reply.Command)
 	if execx.IsPureCD(command) {
 		m.cwd = tuiResolveCD(m.cwd, command)
 		m.lines = append(m.lines, styleCmd(m.cfg.UI.Color, command+"  (cwd → "+m.cwd+")"))
 		m.userCtx = fmt.Sprintf("(cd → %s)\n%s", m.cwd, m.userCtx)
 		m.render()
+		if doneFirst {
+			m.lines = append(m.lines, reply.Message)
+			m.finishPrompt([]string{command}, 0)
+			m.m = modeInput
+			m.input.Focus()
+			m.render()
+			return
+		}
 		m.nextTurn("(cd ok)")
 		return
 	}
@@ -727,6 +740,17 @@ func (m *replModel) handleExecDone(msg execDoneMsg) {
 	if len(m.sess) > 20 {
 		m.sess = m.sess[len(m.sess)-20:]
 	}
+	if m.pendingDone {
+		m.pendingDone = false
+		if m.pendingMsg != "" {
+			m.lines = append(m.lines, m.pendingMsg)
+		}
+		m.finishPrompt([]string{msg.command}, msg.res.ExitCode)
+		m.m = modeInput
+		m.input.Focus()
+		m.render()
+		return
+	}
 	m.turn++
 	if m.turn >= m.cfg.Defaults.MaxTurns {
 		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(max-turns reached)"))
@@ -748,7 +772,8 @@ func (m *replModel) startLLMTurnContinue() {
 	m.streamed = ""
 	baseURL, model, key, _ := m.llmReq()
 	if key == "" {
-		m.lines = append(m.lines, styleErr(m.cfg.UI.Color, "no API key"))
+		m.lines = append(m.lines, styleErr(m.cfg.UI.Color,
+			"no API key — get a free Groq key at "+llm.GroqKeyURL+", then `argon settings`"))
 		m.m = modeInput
 		m.input.Focus()
 		return

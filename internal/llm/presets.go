@@ -1,6 +1,7 @@
-// Package llm: OpenAI-compatible client (streaming SSE) + presets.
-// v0.1 implements openai_compat only. Anthropic native is deferred;
-// use OpenRouter/custom baseURL for Claude.
+// Package llm: OpenAI-compatible client (streaming SSE).
+// Providers: groq (default, free) + custom OpenAI-compatible baseURL.
+// All wire traffic is openai_compat; model is free-text (selector offers
+// presets, never validates — IDs rot).
 package llm
 
 type Preset struct {
@@ -10,20 +11,24 @@ type Preset struct {
 	Model   string // docs-only initial value; model is free-text
 }
 
+// GroqModels are the selector presets (user-verified on console.groq.com).
+// Free-text override always allowed via advanced screen / --model.
+var GroqModels = []string{
+	"openai/gpt-oss-120b",
+	"openai/gpt-oss-20b",
+	"qwen/qwen3.8-27b",
+}
+
+// DefaultModel is the v0.1 default.
+const DefaultModel = "openai/gpt-oss-120b"
+
+const GroqBaseURL = "https://api.groq.com/openai/v1"
+const GroqKeyEnv = "GROQ_API_KEY"
+const GroqKeyURL = "https://console.groq.com/keys"
+
 func Presets() []Preset {
 	return []Preset{
-		{"openai", "https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-4o-mini"},
-		{"gemini", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", "gemini-2.0-flash"},
-		{"groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "llama-3.3-70b-versatile"},
-		{"openrouter", "https://api.openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openrouter/auto"},
-		{"nvidia", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", "nvidia/llama-3.1-nemotron-70b-instruct"},
-		{"cerebras", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", "llama-3.3-70b"},
-		{"mistral", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", "mistral-small-latest"},
-		{"deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"},
-		{"together", "https://api.together.xyz/v1", "TOGETHER_API_KEY", "meta-llama/Llama-3.3-70B-Instruct-Turbo"},
-		{"fireworks", "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY", "accounts/fireworks/models/llama-v3p3-70b-instruct"},
-		{"xai", "https://api.x.ai/v1", "XAI_API_KEY", "grok-3-mini"},
-		{"ollama", "http://localhost:11434/v1", "", "qwen2.5-coder:7b"},
+		{"groq", GroqBaseURL, GroqKeyEnv, DefaultModel},
 		{"custom", "", "ARGON_API_KEY", ""},
 	}
 }

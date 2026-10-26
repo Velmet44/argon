@@ -87,19 +87,68 @@ func presetKeys() []string {
 }
 
 func providerForm(w *config.Config) error {
-	preset := w.LLM.Preset
-	baseURL, model, apiKey := w.LLM.BaseURL, w.LLM.Model, w.LLM.APIKey
-	def := llm.Lookup(preset)
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().Title("Provider preset").Options(huh.NewOptions(presetKeys()...)...).Value(&preset),
-		huh.NewInput().Title("Base URL (empty = preset default)").Placeholder(def.BaseURL).Value(&baseURL),
-		huh.NewInput().Title("Model (empty = preset default)").Placeholder(def.Model).Value(&model),
-		huh.NewInput().Title("API key (env var wins; stored 0600 if typed here)").Password(true).Placeholder("(env/empty = use env var)").Value(&apiKey),
+	// Simple screen: Groq key + model selector. Advanced: full groq/custom editor.
+	model := w.LLM.Model
+	if model == "" {
+		model = llm.DefaultModel
+	}
+	apiKey := w.LLM.APIKey
+	simple := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Groq model").
+			Description("Free tier: 30 req/min. Verified IDs from console.groq.com").
+			Options(huh.NewOptions(llm.GroqModels...)...).
+			Value(&model),
+		huh.NewInput().
+			Title("Groq API key").
+			Description("Get a free key at "+llm.GroqKeyURL+" (or set GROQ_API_KEY)").
+			Password(true).Placeholder("(env/empty = use env var)").
+			Value(&apiKey),
 	))
-	if err := form.Run(); err != nil {
+	if err := simple.Run(); err != nil {
 		return err
 	}
-	w.LLM.Preset, w.LLM.BaseURL, w.LLM.Model, w.LLM.APIKey = preset, strings.TrimSpace(baseURL), strings.TrimSpace(model), strings.TrimSpace(apiKey)
+	w.LLM.Preset = "groq"
+	w.LLM.Model = strings.TrimSpace(model)
+	if w.LLM.Model == "" {
+		w.LLM.Model = llm.DefaultModel
+	}
+	w.LLM.APIKey = strings.TrimSpace(apiKey)
+	var advanced bool
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().Title("Advanced options (custom base URL / model)?").Value(&advanced),
+	)).Run(); err != nil {
+		return err
+	}
+	if !advanced {
+		w.LLM.BaseURL = ""
+		return testPrompt(w)
+	}
+	// Advanced: current-style editor, groq|custom only.
+	preset, baseURL, freeModel, key := w.LLM.Preset, w.LLM.BaseURL, w.LLM.Model, w.LLM.APIKey
+	if preset != "groq" && preset != "custom" {
+		preset = "groq"
+	}
+	adv := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Title("Provider").Options(huh.NewOptions("groq", "custom")...).Value(&preset),
+		huh.NewInput().Title("Base URL (empty = preset default)").Placeholder(llm.GroqBaseURL).Value(&baseURL),
+		huh.NewInput().Title("Model (free-text, overrides selector)").Placeholder(llm.DefaultModel).Value(&freeModel),
+		huh.NewInput().Title("API key").Password(true).Placeholder("(env/empty = use env var)").Value(&key),
+	))
+	if err := adv.Run(); err != nil {
+		return err
+	}
+	w.LLM.Preset = preset
+	w.LLM.BaseURL = strings.TrimSpace(baseURL)
+	w.LLM.Model = strings.TrimSpace(freeModel)
+	if w.LLM.Model == "" {
+		w.LLM.Model = llm.DefaultModel
+	}
+	w.LLM.APIKey = strings.TrimSpace(key)
+	return testPrompt(w)
+}
+
+func testPrompt(w *config.Config) error {
 	var test bool
 	if err := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().Title("Test connection now?").Value(&test),

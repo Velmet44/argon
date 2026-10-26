@@ -53,6 +53,7 @@ func StreamChat(ctx context.Context, req TurnRequest, out chan<- Chunk) {
 		"model":       req.Model,
 		"messages":    buildMessages(req),
 		"temperature": 0.2,
+		"max_tokens":  1024,
 		"stream":      true,
 	}
 	raw, _ := json.Marshal(body)
@@ -129,7 +130,7 @@ func (e *HTTPError) Error() string {
 // CompleteOnce is the --stream=false path: single JSON response.
 func CompleteOnce(ctx context.Context, req TurnRequest) (string, error) {
 	body := map[string]any{
-		"model": req.Model, "messages": buildMessages(req), "temperature": 0.2, "stream": false,
+		"model": req.Model, "messages": buildMessages(req), "temperature": 0.2, "max_tokens": 1024, "stream": false,
 	}
 	raw, _ := json.Marshal(body)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", strings.TrimSuffix(req.BaseURL, "/")+"/chat/completions", bytes.NewReader(raw))

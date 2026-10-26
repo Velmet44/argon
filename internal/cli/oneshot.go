@@ -57,7 +57,7 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 	}
 	apiKey := cfg.APIKey()
 	if apiKey == "" {
-		return fmt.Errorf("no API key — set %s (or ARGON_API_KEY) or run `argon settings`", preset.KeyEnv)
+		return fmt.Errorf("no API key — get a free Groq key at %s, then `argon settings` (or set %s)", llm.GroqKeyURL, preset.KeyEnv)
 	}
 
 	cwdState := ci.CWD
@@ -106,16 +106,24 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		if reply.Thought != "" {
 			fmt.Println(dim("◈ "+reply.Thought))
 		}
-		if reply.Done || reply.Command == nil || *reply.Command == "" {
+		if reply.Command == nil || strings.TrimSpace(*reply.Command) == "" {
 			fmt.Println(reply.Message)
 			return appendHistory("oneshot", prompt, nil, 0)
 		}
+		if reply.Done {
+			fmt.Println(dim("(final step)"))
+		}
+		doneFirst := reply.Done
 		command := strings.TrimSpace(*reply.Command)
 		// pure cd → local state update, no exec
 		if execx.IsPureCD(command) {
 			cwdState = resolveCD(cwdState, command)
 			userCtx = fmt.Sprintf("(cd → %s)\n%s", cwdState, userCtx)
 			fmt.Println(boldYellow("$ " + command + "  (cwd → " + cwdState + ")"))
+			if doneFirst {
+				fmt.Println(reply.Message)
+				return appendHistory("oneshot", prompt, []string{command}, 0)
+			}
 			continue
 		}
 		disabled := map[string]bool{}
@@ -154,6 +162,10 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 			res.Output = res.Output[:80*1024] + "\n…[session cap]…"
 		}
 		userCtx = fmt.Sprintf("command: %s\nexit: %d\noutput:\n%s", command, res.ExitCode, risk.Redact(res.Output))
+		if doneFirst {
+			fmt.Println(reply.Message)
+			return appendHistory("oneshot", prompt, []string{command}, res.ExitCode)
+		}
 		if turn == maxTurns {
 			fmt.Println(dim("(max-turns reached)"))
 			return appendHistory("oneshot", prompt, []string{command}, res.ExitCode)

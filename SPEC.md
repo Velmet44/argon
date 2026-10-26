@@ -104,30 +104,22 @@ Keys: Tab sections, arrows/Enter edit, Ctrl+S save, Esc back (prompt if dirty), 
 - In REPL, `/clear` clears session turns; file history still included on next turn if history=on (document this). `argon history --clear` wipes `~/.argon/history.jsonl` + offers to truncate shell history file (explicit only).
 - Never send history unless flag/session enabled. Show `+history(32)` indicator when active.
 
-## 4. Providers (Cloud, BYOK, OpenAI-compatible only in v0.1)
+## 4. Providers (Groq default + custom OpenAI-compatible)
 
-No bundled key. Precedence: env var → config file → prompt in settings. `custom` allows any baseURL. Model column is docs-only initial value; `model` is free-text in code (do not hardcode allowlist, names rot).
+No bundled key. Precedence: env var → config file → prompt in settings. Model is free-text; selector offers presets, never validates (IDs rot).
 
-| preset key | baseURL | key env | initial model example |
+Default: `preset=groq`, `model=openai/gpt-oss-120b`, `baseURL=https://api.groq.com/openai/v1`, key via `GROQ_API_KEY` env (free at https://console.groq.com/keys) or `argon settings`.
+
+| preset key | baseURL | key env | model presets (selector) |
 |---|---|---|---|
-| openai | https://api.openai.com/v1 | OPENAI_API_KEY | gpt-4o-mini |
-| anthropic | via openrouter/custom in v0.1 (native driver deferred to v0.2) | ANTHROPIC_API_KEY | claude-3-5-haiku-latest |
-| gemini | https://generativelanguage.googleapis.com/v1beta/openai/ | GEMINI_API_KEY | gemini-2.0-flash |
-| groq | https://api.groq.com/openai/v1 | GROQ_API_KEY | llama-3.3-70b-versatile |
-| openrouter | https://openrouter.ai/api/v1 | OPENROUTER_API_KEY | openrouter/auto |
-| nvidia | https://integrate.api.nvidia.com/v1 | NVIDIA_API_KEY | nvidia/llama-3.1-nemotron-70b-instruct |
-| cerebras | https://api.cerebras.ai/v1 | CEREBRAS_API_KEY | llama-3.3-70b |
-| mistral | https://api.mistral.ai/v1 | MISTRAL_API_KEY | mistral-small-latest |
-| deepseek | https://api.deepseek.com/v1 | DEEPSEEK_API_KEY | deepseek-chat |
-| together | https://api.together.xyz/v1 | TOGETHER_API_KEY | meta-llama/Llama-3.3-70B-Instruct-Turbo |
-| fireworks | https://api.fireworks.ai/inference/v1 | FIREWORKS_API_KEY | accounts/fireworks/models/llama-v3p3-70b-instruct |
-| xai | https://api.x.ai/v1 | XAI_API_KEY | grok-3-mini |
-| ollama | http://localhost:11434/v1 | — | qwen2.5-coder:7b |
-| custom | user input | ARGON_API_KEY | user input |
+| groq | https://api.groq.com/openai/v1 | GROQ_API_KEY | openai/gpt-oss-120b (default), openai/gpt-oss-20b, qwen/qwen3.8-27b |
+| custom | user input | ARGON_API_KEY | user free-text |
 
-*v0.1 implements `openai_compat` driver only. Anthropic preset routes via OpenRouter/custom baseURL. Native `anthropic_native` driver (different headers + `content_block_delta` streaming) is v0.2.
+Simple settings screen: Groq model selector (3 above) + Groq API key field. Advanced: full editor restricted to `groq|custom` (baseURL + free-text model + key). No other vendors in v0.1. No-key flow prints the console.groq.com/keys link (one-shot exits 1, REPL stays alive).
 
-Request: OpenAI chat-completions, temp 0.2, `stream:true` by default (Sec 6.1). Do NOT set `response_format:json_object` in v0.1 (breaks streaming on Groq/Cerebras/Fireworks/NIM). Prompt for JSON-only + validate on DONE + 1 repair retry. Per-turn `context.WithTimeout(llm-timeout)`, `http.Client{Timeout:0}` for streams. On SSE error fall back to single retry with `stream:false`. Handle 429/5xx with 1 backoff retry (2s, then surface error).
+*v0.1 implements `openai_compat` driver only.
+
+Request: OpenAI chat-completions, temp 0.2, max_tokens 1024, `stream:true` by default (Sec 6.1). Do NOT set `response_format:json_object` in v0.1 (breaks streaming on some gateways). Prompt for JSON-only + validate on DONE + 1 repair retry. Per-turn `context.WithTimeout(llm-timeout)`, `http.Client{Timeout:0}` for streams. On SSE error fall back to single retry with `stream:false`. Handle 429/5xx with 1 backoff retry (2s, then surface error).
 
 ## 5. Context collector (per turn)
 

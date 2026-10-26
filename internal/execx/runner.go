@@ -78,7 +78,7 @@ func Run(ctx context.Context, shell, cmd, dir string, timeout time.Duration, onC
 		if _, err := exec.LookPath(bin); err != nil && runtime.GOOS == "windows" {
 			bin = "powershell"
 		}
-		c = exec.CommandContext(ctx, bin, "-NoProfile", "-NonInteractive", "-EncodedCommand", EncodePowerShell(cmd))
+		c = exec.CommandContext(ctx, bin, "-NoProfile", "-NonInteractive", "-EncodedCommand", EncodePowerShell("$ProgressPreference='SilentlyContinue'; "+cmd))
 	default:
 		c = exec.CommandContext(ctx, "bash", "-lc", cmd)
 	}

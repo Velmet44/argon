@@ -51,7 +51,7 @@ type Config struct {
 
 func Default() Config {
 	return Config{
-		LLM: LLMConfig{Preset: "groq", Model: "", BaseURL: ""},
+		LLM: LLMConfig{Preset: "groq", Model: "openai/gpt-oss-120b", BaseURL: ""},
 		Defaults: DefaultsConfig{
 			Shell: "auto", MaxTurns: 8,
 			LLMTimeoutSec: 90, ExecTimeoutSec: 60,
@@ -151,28 +151,10 @@ func (c Config) APIKey() string {
 
 func presetKeyEnv(preset string) string {
 	switch preset {
-	case "openai":
-		return "OPENAI_API_KEY"
-	case "gemini":
-		return "GEMINI_API_KEY"
 	case "groq":
 		return "GROQ_API_KEY"
-	case "openrouter":
-		return "OPENROUTER_API_KEY"
-	case "nvidia":
-		return "NVIDIA_API_KEY"
-	case "cerebras":
-		return "CEREBRAS_API_KEY"
-	case "mistral":
-		return "MISTRAL_API_KEY"
-	case "deepseek":
-		return "DEEPSEEK_API_KEY"
-	case "together":
-		return "TOGETHER_API_KEY"
-	case "fireworks":
-		return "FIREWORKS_API_KEY"
-	case "xai":
-		return "XAI_API_KEY"
+	case "custom":
+		return "ARGON_API_KEY"
 	}
 	return ""
 }
