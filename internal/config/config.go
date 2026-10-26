@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -42,11 +43,24 @@ type RiskConfig struct {
 	Disabled         []string `toml:"disabled"`          // rule IDs from defaults to turn off
 }
 
+// HistoryConfig controls what past context enters each prompt.
+// All of it stays on this machine (~/.argon/history.jsonl, 0600);
+// history is only ever uploaded as (redacted) prompt context.
+type HistoryConfig struct {
+	RememberTurns       bool `toml:"remember_turns"`        // include own past tasks
+	RememberLimit       int  `toml:"remember_limit"`        // last N finished tasks
+	RememberOutputChars int  `toml:"remember_output_chars"` // stored/sent output chars per past turn
+	ShellHistory        bool `toml:"shell_history"`         // include PSReadLine/bash history
+	ShellHistoryLimit   int  `toml:"shell_history_limit"`   // entries, newest last
+	FileMax             int  `toml:"file_max"`              // prune history file to N lines
+}
+
 type Config struct {
 	LLM      LLMConfig      `toml:"llm"`
 	Defaults DefaultsConfig `toml:"defaults"`
 	UI       UIConfig       `toml:"ui"`
 	Risk     RiskConfig     `toml:"risk"`
+	History  HistoryConfig  `toml:"history"`
 }
 
 func Default() Config {
@@ -58,6 +72,10 @@ func Default() Config {
 			History: false, HistoryLimit: 50, ConfirmWrite: true,
 		},
 		UI: UIConfig{Color: true, Verbose: false, Stream: true},
+		History: HistoryConfig{
+			RememberTurns: true, RememberLimit: 5, RememberOutputChars: 800,
+			ShellHistory: true, ShellHistoryLimit: 50, FileMax: 200,
+		},
 	}
 }
 
@@ -86,22 +104,62 @@ func Path() (string, error) {
 }
 
 func Load() (Config, error) {
-	cfg := Default()
 	p, err := Path()
 	if err != nil {
-		return cfg, err
+		return Default(), err
 	}
 	if _, err := os.Stat(p); errors.Is(err, os.ErrNotExist) {
-		return cfg, nil
+		return Default(), nil
 	}
-	if _, err := toml.DecodeFile(p, &cfg); err != nil {
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return Default(), err
+	}
+	return decode(raw)
+}
+
+// LoadFrom reads cfg from an explicit path (import). Same migration and
+// clamps as Load so imports behave identically.
+func LoadFrom(p string) (Config, error) {
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return Default(), err
+	}
+	return decode(raw)
+}
+
+func decode(raw []byte) (Config, error) {
+	cfg := Default()
+	if _, err := toml.Decode(string(raw), &cfg); err != nil {
 		return cfg, err
+	}
+	// Migrate pre-[history] configs: an explicit old shell-history choice
+	// wins over the new default; pristine files get the new defaults.
+	if !strings.Contains(string(raw), "[history") {
+		if cfg.Defaults.History || cfg.Defaults.HistoryLimit != 50 {
+			cfg.History.ShellHistory = cfg.Defaults.History
+			if cfg.Defaults.HistoryLimit > 0 {
+				cfg.History.ShellHistoryLimit = cfg.Defaults.HistoryLimit
+			}
+		}
 	}
 	if cfg.Defaults.MaxTurns <= 0 {
 		cfg.Defaults.MaxTurns = 8
 	}
 	if cfg.Defaults.MaxTurns > 20 {
 		cfg.Defaults.MaxTurns = 20
+	}
+	if cfg.History.RememberLimit <= 0 {
+		cfg.History.RememberLimit = 5
+	}
+	if cfg.History.RememberOutputChars <= 0 {
+		cfg.History.RememberOutputChars = 800
+	}
+	if cfg.History.ShellHistoryLimit <= 0 {
+		cfg.History.ShellHistoryLimit = 50
+	}
+	if cfg.History.FileMax < 10 {
+		cfg.History.FileMax = 200
 	}
 	return cfg, nil
 }
@@ -125,15 +183,6 @@ func SaveTo(cfg Config, p string) error {
 	}
 	defer f.Close()
 	return toml.NewEncoder(f).Encode(cfg)
-}
-
-// LoadFrom reads cfg from an explicit path (import).
-func LoadFrom(p string) (Config, error) {
-	cfg := Default()
-	if _, err := toml.DecodeFile(p, &cfg); err != nil {
-		return cfg, err
-	}
-	return cfg, nil
 }
 
 // APIKey resolves env-var first, then config file.

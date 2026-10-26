@@ -33,8 +33,9 @@ func TestTruncateOutput(t *testing.T) {
 
 func TestBuildUserMessageShape(t *testing.T) {
 	m := BuildUserMessage("powershell", "win", `C:\x`, "a.txt", "Do the thing", []string{"h1"},
-		[]Step{{Cmd: "Get-X", Exit: 0, Digest: "2 lines; first: \"a\"", Note: "Did X"}}, 2, 8, "out", 0, false)
-	for _, want := range []string{"CONTEXT:", "TASK: Do the thing", "STEPS", "Get-X", "note: Did X", "LATEST OUTPUT", "<<<OUTPUT", "OUTPUT>>>", "NEXT:", "Original task again", "2/8"} {
+		[]Step{{Cmd: "Get-X", Exit: 0, Digest: "2 lines; first: \"a\"", Note: "Did X"}},
+		[]PrevTask{{Prompt: "old task", Cmd: "Get-Y", Out: "y1\ny2"}}, 2, 8, "out", 0, false)
+	for _, want := range []string{"CONTEXT:", "TASK: Do the thing", "STEPS", "Get-X", "note: Did X", "LATEST OUTPUT", "<<<OUTPUT", "OUTPUT>>>", "NEXT:", "Original task again", "2/8", "PREVIOUS TASKS", "old task", "Get-Y"} {
 		if !strings.Contains(m, want) {
 			t.Errorf("missing %q in:\n%s", want, m)
 		}
@@ -43,12 +44,12 @@ func TestBuildUserMessageShape(t *testing.T) {
 	if strings.Count(m, "Do the thing") < 2 {
 		t.Error("task must appear at least twice")
 	}
-	m1 := BuildUserMessage("bash", "linux", "/h", "", "t", nil, nil, 1, 8, "", 0, false)
+	m1 := BuildUserMessage("bash", "linux", "/h", "", "t", nil, nil, nil, 1, 8, "", 0, false)
 	if !strings.Contains(m1, "none yet") || !strings.Contains(m1, "none (first step)") {
 		t.Errorf("turn-1 shape: %s", m1)
 	}
 	m2 := BuildUserMessage("bash", "linux", "/h", "", "t", nil,
-		[]Step{{Cmd: "rm x", Exit: 0, Digest: "d", Note: ""}}, 2, 8, "out", 0, true)
+		[]Step{{Cmd: "rm x", Exit: 0, Digest: "d", Note: ""}}, nil, 2, 8, "out", 0, true)
 	if !strings.Contains(m2, "verify it with a read-only command now") {
 		t.Errorf("mustVerify order missing: %s", m2)
 	}

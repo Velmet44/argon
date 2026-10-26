@@ -15,6 +15,14 @@ type Step struct {
 	Note   string
 }
 
+// PrevTask is one FINISHED older task, for referents like "that folder".
+// Built by history.RecentTasks with outputs already truncated.
+type PrevTask struct {
+	Prompt string
+	Cmd    string
+	Out    string
+}
+
 // DigestOutput summarizes command output shape: "N lines; first: ...".
 // Only the latest output ever travels in full; older steps travel as digests.
 func DigestOutput(out string) string {
@@ -52,12 +60,23 @@ func TruncateOutput(out string) (string, bool) {
 	return out[:head] + fmt.Sprintf("\n[... %d chars omitted ...]\n", omitted) + out[len(out)-tail:], true
 }
 
+// singleLine flattens text for one-line slots (PREVIOUS TASKS outputs).
+func singleLine(s string, n int) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", " "), "\n", " ")
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
 // BuildUserMessage assembles one self-contained user message per turn.
 // The original task is repeated verbatim every turn (top and bottom) so the
 // model never loses it; older steps travel as local digests, never raw.
 // mustVerify adds an explicit verification order when the previous turn
 // modified the system (write/delete without a confirming read yet).
-func BuildUserMessage(shell, os, cwd, ls, task string, shellHist []string, steps []Step, stepN, maxTurns int, out string, outExit int, mustVerify bool) string {
+// prev carries finished older tasks so follow-ups resolve across processes.
+func BuildUserMessage(shell, os, cwd, ls, task string, shellHist []string, steps []Step, prev []PrevTask, stepN, maxTurns int, out string, outExit int, mustVerify bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CONTEXT: shell=%s os=%s cwd=%s step=%d/%d\n", shell, os, cwd, stepN, maxTurns)
 	if ls != "" {
@@ -96,6 +115,17 @@ func BuildUserMessage(shell, os, cwd, ls, task string, shellHist []string, steps
 			}
 		}
 		b.WriteString("OUTPUT>>>\n")
+	}
+	b.WriteString("PREVIOUS TASKS (older, for referents like \"that folder\"):\n")
+	if len(prev) == 0 {
+		b.WriteString("none yet\n")
+	} else {
+		for i, t := range prev {
+			fmt.Fprintf(&b, "%d. %q -> %s\n", i+1, t.Prompt, t.Cmd)
+			if strings.TrimSpace(t.Out) != "" {
+				b.WriteString("   out: " + singleLine(t.Out, 500) + "\n")
+			}
+		}
 	}
 	fmt.Fprintf(&b, "NEXT: Reply with one JSON object. Original task again: %q. Does LATEST OUTPUT already answer it? Yes -> done:true with the values. No -> the single next command.", task)
 	if mustVerify {

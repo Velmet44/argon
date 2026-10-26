@@ -18,8 +18,8 @@ func runREPL(cmd *cobra.Command) error {
 	}
 	ci := xcontext.Collect()
 	var hist []string
-	if cfg.Defaults.History {
-		limit := cfg.Defaults.HistoryLimit
+	if cfg.History.ShellHistory {
+		limit := cfg.History.ShellHistoryLimit
 		if limit <= 0 {
 			limit = 50
 		}

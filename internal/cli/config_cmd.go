@@ -29,9 +29,12 @@ func newConfigCmd() *cobra.Command {
 				}
 				fmt.Printf("llm.preset=%s\nllm.model=%s\nllm.base_url=%s\nllm.api_key=%s\n",
 					cfg.LLM.Preset, cfg.LLM.Model, cfg.LLM.BaseURL, mask(cfg.APIKey()))
-				fmt.Printf("defaults.shell=%s max_turns=%d llm_timeout_sec=%d exec_timeout_sec=%d history=%v history_limit=%d confirm_write=%v\n",
+				fmt.Printf("defaults.shell=%s max_turns=%d llm_timeout_sec=%d exec_timeout_sec=%d confirm_write=%v\n",
 					cfg.Defaults.Shell, cfg.Defaults.MaxTurns, cfg.Defaults.LLMTimeoutSec, cfg.Defaults.ExecTimeoutSec,
-					cfg.Defaults.History, cfg.Defaults.HistoryLimit, cfg.Defaults.ConfirmWrite)
+					cfg.Defaults.ConfirmWrite)
+				fmt.Printf("history.remember_turns=%v remember_limit=%d remember_output_chars=%d shell_history=%v shell_history_limit=%d file_max=%d\n",
+					cfg.History.RememberTurns, cfg.History.RememberLimit, cfg.History.RememberOutputChars,
+					cfg.History.ShellHistory, cfg.History.ShellHistoryLimit, cfg.History.FileMax)
 				fmt.Printf("ui.color=%v ui.verbose=%v ui.stream=%v\n", cfg.UI.Color, cfg.UI.Verbose, cfg.UI.Stream)
 				fmt.Printf("risk.extra_deny=%s\nrisk.extra_destructive=%s\nrisk.disabled=%s\n",
 					strings.Join(cfg.Risk.ExtraDeny, ","), strings.Join(cfg.Risk.ExtraDestructive, ","), strings.Join(cfg.Risk.Disabled, ","))
@@ -41,7 +44,7 @@ func newConfigCmd() *cobra.Command {
 		&cobra.Command{
 			Use:   "set <key> <value>",
 			Short: "Set one key — same fields as `argon settings`",
-			Long: "Keys: llm.preset|model|base_url|api_key, defaults.shell|max_turns|llm_timeout_sec|exec_timeout_sec|history|history_limit|confirm_write, ui.color|verbose|stream, risk.extra_deny|extra_destructive|disabled (comma-sep)",
+			Long: "Keys: llm.preset|model|base_url|api_key, defaults.shell|max_turns|llm_timeout_sec|exec_timeout_sec|confirm_write, history.remember_turns|remember_limit|remember_output_chars|shell_history|shell_history_limit|file_max, ui.color|verbose|stream, risk.extra_deny|extra_destructive|disabled (comma-sep)",
 			Args:  cobra.ExactArgs(2),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				k, v := strings.ToLower(args[0]), args[1]
@@ -81,11 +84,23 @@ func newConfigCmd() *cobra.Command {
 				case "defaults.exec_timeout_sec":
 					cfg.Defaults.ExecTimeoutSec, err = atoi(5, 600)
 				case "defaults.history":
-					cfg.Defaults.History = boolean()
+					cfg.History.ShellHistory = boolean()
 				case "defaults.history_limit":
-					cfg.Defaults.HistoryLimit, err = atoi(1, 200)
+					cfg.History.ShellHistoryLimit, err = atoi(1, 200)
 				case "defaults.confirm_write":
 					cfg.Defaults.ConfirmWrite = boolean()
+				case "history.remember_turns":
+					cfg.History.RememberTurns = boolean()
+				case "history.remember_limit":
+					cfg.History.RememberLimit, err = atoi(1, 20)
+				case "history.remember_output_chars":
+					cfg.History.RememberOutputChars, err = atoi(100, 8000)
+				case "history.shell_history":
+					cfg.History.ShellHistory = boolean()
+				case "history.shell_history_limit":
+					cfg.History.ShellHistoryLimit, err = atoi(1, 200)
+				case "history.file_max":
+					cfg.History.FileMax, err = atoi(10, 5000)
 				case "ui.color":
 					cfg.UI.Color = boolean()
 				case "ui.verbose":
@@ -136,11 +151,23 @@ func newConfigCmd() *cobra.Command {
 				case "defaults.exec_timeout_sec":
 					fmt.Println(cfg.Defaults.ExecTimeoutSec)
 				case "defaults.history":
-					fmt.Println(cfg.Defaults.History)
+					fmt.Println(cfg.History.ShellHistory, "(legacy alias of history.shell_history)")
 				case "defaults.history_limit":
-					fmt.Println(cfg.Defaults.HistoryLimit)
+					fmt.Println(cfg.History.ShellHistoryLimit, "(legacy alias of history.shell_history_limit)")
 				case "defaults.confirm_write":
 					fmt.Println(cfg.Defaults.ConfirmWrite)
+				case "history.remember_turns":
+					fmt.Println(cfg.History.RememberTurns)
+				case "history.remember_limit":
+					fmt.Println(cfg.History.RememberLimit)
+				case "history.remember_output_chars":
+					fmt.Println(cfg.History.RememberOutputChars)
+				case "history.shell_history":
+					fmt.Println(cfg.History.ShellHistory)
+				case "history.shell_history_limit":
+					fmt.Println(cfg.History.ShellHistoryLimit)
+				case "history.file_max":
+					fmt.Println(cfg.History.FileMax)
 				case "ui.color":
 					fmt.Println(cfg.UI.Color)
 				case "ui.verbose":

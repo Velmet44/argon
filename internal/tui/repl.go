@@ -6,7 +6,6 @@ package tui
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,8 +18,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/Velmet44/argon/internal/config"
 	"github.com/Velmet44/argon/internal/execx"
+	"github.com/Velmet44/argon/internal/history"
 	"github.com/Velmet44/argon/internal/llm"
 	"github.com/Velmet44/argon/internal/risk"
+	"github.com/Velmet44/argon/internal/xcontext"
 )
 
 type mode int
@@ -85,6 +86,9 @@ type replModel struct {
 	lastNote   string
 	sess      []sessTurn
 	curOut    *rBlock // live command output block
+	taskCmds  []string // finished-task transcript: every considered command
+	taskOuts  []string // parallel outputs ("" until executed)
+	outIdx    int      // index into taskOuts for the in-flight command
 
 	inputHist []string
 	histIdx   int
@@ -126,7 +130,7 @@ func (m *replModel) header() string {
 }
 
 func historyBadge(m *replModel) string {
-	if m.cfg.Defaults.History {
+	if m.cfg.History.ShellHistory {
 		return fmt.Sprintf(" · +history(%d)", len(m.histFile))
 	}
 	return ""
@@ -598,13 +602,22 @@ func (m *replModel) handleSlash(val string) {
 		m.addMeta(fmt.Sprintf("stream=%v", m.cfg.UI.Stream))
 	case "/history":
 		if strings.ToLower(arg) == "off" {
-			m.cfg.Defaults.History = false
+			m.cfg.History.ShellHistory = false
 		} else if strings.ToLower(arg) == "on" {
-			m.cfg.Defaults.History = true
+			m.cfg.History.ShellHistory = true
 		} else {
-			m.cfg.Defaults.History = !m.cfg.Defaults.History
+			m.cfg.History.ShellHistory = !m.cfg.History.ShellHistory
 		}
-		m.addMeta(fmt.Sprintf("history=%v", m.cfg.Defaults.History))
+		if m.cfg.History.ShellHistory {
+			limit := m.cfg.History.ShellHistoryLimit
+			if limit <= 0 {
+				limit = 50
+			}
+			m.histFile = xcontext.ReadHistory(limit)
+		} else {
+			m.histFile = nil
+		}
+		m.addMeta(fmt.Sprintf("history=%v", m.cfg.History.ShellHistory))
 	case "/force":
 		if strings.ToLower(arg) == "off" {
 			m.force = false
@@ -638,6 +651,7 @@ func (m *replModel) startPrompt(p string) {
 	m.pendingDone, m.pendingMsg = false, ""
 	m.lastDigest, m.lastNote = "", ""
 	m.expectVerify, m.lastTier, m.enforceOnce = false, "", false
+	m.taskCmds, m.taskOuts, m.outIdx = nil, nil, -1
 	m.curOut = nil
 	m.addEcho(p)
 	m.startLLMTurn(m.buildFreshCtx())
@@ -648,14 +662,15 @@ func (m *replModel) buildFreshCtx() string {
 }
 
 // buildCtx assembles one self-contained user message: original task verbatim
-// every turn, STEPS ledger from local digests + prior notes, latest output.
+// every turn, STEPS ledger from local digests + prior notes (current task
+// only), PREVIOUS TASKS from the on-disk transcript (cross-prompt memory),
+// latest output. Shell history follows the [history] settings.
 func (m *replModel) buildCtx(out string, exitCode int, hasOut bool) string {
-	turns := m.sess
-	if len(turns) > 5 {
-		turns = turns[len(turns)-5:]
-	}
-	steps := make([]llm.Step, 0, len(turns))
-	for _, t := range turns {
+	steps := make([]llm.Step, 0, len(m.sess))
+	for _, t := range m.sess {
+		if t.Prompt != m.prompt {
+			continue // previous tasks live in PREVIOUS TASKS, not STEPS
+		}
 		steps = append(steps, llm.Step{
 			Cmd:    strings.Join(t.Commands, " ; "),
 			Exit:   t.Exit,
@@ -663,12 +678,18 @@ func (m *replModel) buildCtx(out string, exitCode int, hasOut bool) string {
 			Note:   t.Note,
 		})
 	}
+	var prev []llm.PrevTask
+	if m.cfg.History.RememberTurns {
+		if p, err := history.RecentTasks(m.cfg.History.RememberLimit, m.cfg.History.RememberOutputChars); err == nil {
+			prev = p
+		}
+	}
 	var hist []string
-	if m.cfg.Defaults.History {
+	if m.cfg.History.ShellHistory {
 		hist = m.histFile
 	}
 	return llm.BuildUserMessage(m.shell, m.osStr, m.cwd, strings.Join(m.lsTop, ", "),
-		risk.Redact(m.prompt), hist, steps, m.turn+1, m.maxTurns(), out, exitCode, m.expectVerify)
+		risk.Redact(m.prompt), hist, steps, prev, m.turn+1, m.maxTurns(), out, exitCode, m.expectVerify)
 }
 
 // recordStep appends one ledger entry (digest + note set by the caller first).
@@ -842,6 +863,8 @@ func (m *replModel) handleLLMDone(raw string) {
 		m.addMeta("cwd → " + m.cwd)
 		m.lastDigest = "cwd now " + m.cwd
 		m.lastNote = reply.Message
+		m.taskCmds = append(m.taskCmds, command)
+		m.taskOuts = append(m.taskOuts, "(directory changed)")
 		m.render()
 		if doneFirst {
 			if strings.TrimSpace(reply.Message) != "" {
@@ -870,15 +893,8 @@ func (m *replModel) handleLLMDone(raw string) {
 		if strings.TrimSpace(reply.Message) != "" {
 			m.addMsg(reply.Message)
 		}
-		m.finishPrompt([]string{command}, 0)
-		m.m = modeInput
-		m.input.Focus()
-		m.render()
-		return
-	}
-	if !reply.Run {
-		// explicit model signal: display the plan, never execute it
-		m.addMeta("(model asked not to run — displaying only)")
+		m.taskCmds = append(m.taskCmds, command)
+		m.taskOuts = append(m.taskOuts, "")
 		m.recordStep([]string{command}, 0)
 		m.finishPrompt([]string{command}, 0)
 		m.m = modeInput
@@ -886,6 +902,9 @@ func (m *replModel) handleLLMDone(raw string) {
 		m.render()
 		return
 	}
+	m.taskCmds = append(m.taskCmds, command)
+	m.taskOuts = append(m.taskOuts, "")
+	m.outIdx = len(m.taskOuts) - 1
 	switch tier {
 	case risk.TierDeny:
 		m.addErr("blocked: " + why)
@@ -986,6 +1005,9 @@ func (m *replModel) handleExecDone(msg execDoneMsg) {
 	m.addMeta(fmt.Sprintf("(exit %d)", msg.res.ExitCode))
 	m.render()
 	redacted := risk.Redact(msg.res.Output)
+	if m.curOut != nil && m.outIdx >= 0 && m.outIdx < len(m.taskOuts) {
+		m.taskOuts[m.outIdx] = strings.Join(m.curOut.out, "\n")
+	}
 	m.lastDigest = llm.DigestOutput(redacted)
 	m.lastNote = m.pendingMsg
 	m.recordStep([]string{msg.command}, msg.res.ExitCode)
@@ -1097,11 +1119,11 @@ func (m *replModel) nextTurn() {
 	m.startLLMTurnContinue()
 }
 
-func (m *replModel) finishPrompt(cmds []string, exit int) {
+func (m *replModel) finishPrompt(_ []string, exit int) {
 	m.m = modeInput
 	m.status = ""
 	m.input.Focus()
-	appendHistoryTUI("repl", m.prompt, cmds, exit)
+	_ = history.Append("repl", m.prompt, m.taskCmds, m.taskOuts, exit, m.cfg.History.RememberOutputChars, m.cfg.History.FileMax)
 }
 
 func (m *replModel) View() string {
@@ -1201,20 +1223,4 @@ func joinBaseTUI(base, target string) string {
 		return filepath.Clean(target)
 	}
 	return filepath.Clean(filepath.Join(base, target))
-}
-
-func appendHistoryTUI(mode, prompt string, cmds []string, exit int) {
-	d, err := config.Dir()
-	if err != nil {
-		return
-	}
-	_ = os.MkdirAll(d, 0o700)
-	f, err := os.OpenFile(filepath.Join(d, "history.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	e := map[string]any{"mode": mode, "prompt": prompt, "commands": cmds, "exit": exit}
-	b, _ := json.Marshal(e)
-	_, _ = f.Write(append(b, '\n'))
 }

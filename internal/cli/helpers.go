@@ -1,13 +1,11 @@
 package cli
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/Velmet44/argon/internal/config"
+	"github.com/Velmet44/argon/internal/history"
 )
 
 func resolveCD(base, cmd string) string {
@@ -102,27 +100,8 @@ func joinBase(base, target string) string {
 	return filepath.Clean(filepath.Join(base, target))
 }
 
-type histEntry struct {
-	TS       time.Time `json:"ts"`
-	Mode     string    `json:"mode"`
-	Prompt   string    `json:"prompt"`
-	Commands []string  `json:"commands"`
-	Exit     int       `json:"exit"`
-}
-
-func appendHistory(mode, prompt string, cmds []string, exit int) error {
-	d, err := config.Dir()
-	if err != nil {
-		return nil
-	}
-	_ = os.MkdirAll(d, 0o700)
-	f, err := os.OpenFile(filepath.Join(d, "history.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	e := histEntry{TS: time.Now().UTC(), Mode: mode, Prompt: prompt, Commands: cmds, Exit: exit}
-	b, _ := json.Marshal(e)
-	_, _ = f.Write(append(b, '\n'))
-	return nil
+// appendHistory records one finished task (all considered commands + their
+// outputs) to the local transcript log. History must never break a session.
+func appendHistory(mode, prompt string, cmds, outs []string, exit int) error {
+	return history.Append(mode, prompt, cmds, outs, exit, cfg.History.RememberOutputChars, cfg.History.FileMax)
 }

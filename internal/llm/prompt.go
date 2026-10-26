@@ -20,6 +20,7 @@ OPERATING RULES
 5. Solve the TASK in this message, not the latest output. Don't repeat a command already in STEPS unless fixing it.
 6. risk_self = highest effect of the command: read < write < destructive. Unsure = unknown.
 7. done:true needs command null and run false. After a write/delete turn, done:true is forbidden until a later read-only turn has confirmed the result — verify with a read-only check (Get-ChildItem, Test-Path, ls, test -f). After two failed attempts, or at step=8/8, set done:true and say what happened.
+8. thought states the reason and decision (what the output shows, why this command next) — never a paraphrase of the command itself.
 
 Keys exactly: thought (<=15 words), command (string|null), run, done, message (<=2 sentences), risk_self (read|write|destructive|unknown).
 

@@ -229,18 +229,23 @@ func safetyForm(w *config.Config) error {
 
 func defaultsForm(w *config.Config) error {
 	shell, maxTurns := w.Defaults.Shell, w.Defaults.MaxTurns
-	history, limit := w.Defaults.History, w.Defaults.HistoryLimit
+	remember, rememberN := w.History.RememberTurns, w.History.RememberLimit
+	rememberChars, shellHist, shellLimit := w.History.RememberOutputChars, w.History.ShellHistory, w.History.ShellHistoryLimit
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().Title("Default shell").Options(huh.NewOptions("auto", "powershell", "pwsh", "bash", "zsh")...).Value(&shell),
 		intField("Max turns (1–20)", &maxTurns, 1, 20),
-		huh.NewConfirm().Title("Include shell history by default?").Value(&history),
-		intField("History limit (1–200)", &limit, 1, 200),
+		huh.NewConfirm().Title("Remember past tasks across runs?").Description("Last tasks are re-sent as context so follow-ups work.").Value(&remember),
+		intField("Past tasks to remember (1–20)", &rememberN, 1, 20),
+		intField("Output chars kept per past task (100–8000)", &rememberChars, 100, 8000),
+		huh.NewConfirm().Title("Include shell history by default?").Value(&shellHist),
+		intField("Shell history entries (1–200)", &shellLimit, 1, 200),
 	))
 	if err := form.Run(); err != nil {
 		return err
 	}
 	w.Defaults.Shell, w.Defaults.MaxTurns = shell, maxTurns
-	w.Defaults.History, w.Defaults.HistoryLimit = history, limit
+	w.History.RememberTurns, w.History.RememberLimit = remember, rememberN
+	w.History.RememberOutputChars, w.History.ShellHistory, w.History.ShellHistoryLimit = rememberChars, shellHist, shellLimit
 	return nil
 }
 

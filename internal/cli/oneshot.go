@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/Velmet44/argon/internal/execx"
+	"github.com/Velmet44/argon/internal/history"
 	"github.com/Velmet44/argon/internal/llm"
 	"github.com/Velmet44/argon/internal/risk"
 	"github.com/Velmet44/argon/internal/tui"
@@ -33,17 +34,23 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("shell %q not supported in v0.1 — use powershell/pwsh on Windows, bash/zsh on Linux", shell)
 	}
 	ci := xcontext.Collect()
-	useHist := cfg.Defaults.History
+	useHist := cfg.History.ShellHistory
 	if f := cmd.Flags(); f.Changed("history") {
 		useHist, _ = f.GetBool("history")
 	}
-	limit := cfg.Defaults.HistoryLimit
+	limit := cfg.History.ShellHistoryLimit
 	if limit <= 0 {
 		limit = 50
 	}
 	var hist []string
 	if useHist {
 		hist = xcontext.ReadHistory(limit)
+	}
+	var prev []llm.PrevTask
+	if cfg.History.RememberTurns {
+		if p, err := history.RecentTasks(cfg.History.RememberLimit, cfg.History.RememberOutputChars); err == nil {
+			prev = p
+		}
 	}
 	width := tui.TermWidth()
 	fmt.Printf("%s %s\n", dim("◈ argon"), dim(fmt.Sprintf("· %s/%s", ci.OS, shell)+fmt.Sprintf("  +history(%d)", len(hist))))
@@ -79,9 +86,11 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 	lsStr := strings.Join(ci.LsTop, ", ")
 	safePrompt := risk.Redact(prompt)
 	var steps []llm.Step
+	var taskCmds []string
+	var taskOuts []string
 	pendingVerify := false
 	enforceOnce := false
-	userCtx := llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, 1, maxTurns, "", 0, false)
+	userCtx := llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, prev, 1, maxTurns, "", 0, false)
 
 	sessionCap := 0
 	for turn := 1; turn <= maxTurns; turn++ {
@@ -94,7 +103,7 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 				lines = append(lines, "detail: "+err.Error())
 			}
 			printErrBox(fmt.Sprintf("llm request failed · turn %d", turn), lines, width)
-			_ = appendHistory("oneshot", prompt, nil, 1)
+			_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 1)
 			return &SilentError{Code: 1}
 		}
 		if cfg.UI.Verbose {
@@ -116,7 +125,7 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 					lines = append(lines, "detail: "+err.Error())
 				}
 				printErrBox("could not parse model JSON", lines, width)
-				_ = appendHistory("oneshot", prompt, nil, 1)
+				_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 1)
 				return &SilentError{Code: 1}
 			}
 			reply, err = llm.ParseReply(raw2)
@@ -126,7 +135,7 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 					lines = append(lines, "detail: "+err.Error())
 				}
 				printErrBox("could not parse model JSON", lines, width)
-				_ = appendHistory("oneshot", prompt, nil, 1)
+				_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 1)
 				return &SilentError{Code: 1}
 			}
 		}
@@ -136,7 +145,7 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(reply.Message) != "" {
 				printAnswer(reply.Message, width)
 			}
-			_ = appendHistory("oneshot", prompt, nil, 0)
+			_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 0)
 			return nil
 		}
 		doneFirst := reply.Done
@@ -145,7 +154,9 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		if execx.IsPureCD(command) {
 			cwdState = resolveCD(cwdState, command)
 			steps = append(steps, llm.Step{Cmd: command, Exit: 0, Digest: "cwd now " + cwdState, Note: reply.Message})
-			userCtx = llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, turn+1, maxTurns, "", 0, pendingVerify)
+			taskCmds = append(taskCmds, command)
+			taskOuts = append(taskOuts, "(directory changed)")
+			userCtx = llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, prev, turn+1, maxTurns, "", 0, pendingVerify)
 			printCommand(command, "cd", width)
 			fmt.Println(dim("cwd → " + cwdState))
 			blank()
@@ -153,7 +164,7 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 				if strings.TrimSpace(reply.Message) != "" {
 					printAnswer(reply.Message, width)
 				}
-				_ = appendHistory("oneshot", prompt, []string{command}, 0)
+				_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 0)
 				return nil
 			}
 			continue
@@ -175,31 +186,37 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(reply.Message) != "" {
 				printAnswer(reply.Message, width)
 			}
-			_ = appendHistory("oneshot", prompt, []string{command}, 0)
+			taskCmds = append(taskCmds, command)
+			taskOuts = append(taskOuts, "")
+			_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 0)
 			return nil
 		}
+		// track every considered command for the transcript log
+		taskCmds = append(taskCmds, command)
+		taskOuts = append(taskOuts, "")
+		outIdx := len(taskOuts) - 1
 		switch tier {
 		case risk.TierDeny:
 			printErrBox("blocked", []string{why, "If this is wrong, allowlist an exception in `argon settings` → Safety."}, width)
-			_ = appendHistory("oneshot", prompt, []string{command}, 2)
+			_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 2)
 			return &SilentError{Code: 2}
 		case risk.TierDestr:
 			if !force || !confirmYES() {
 				printErrBox("destructive refused", []string{"Needs --force plus typing YES.", why}, width)
-				_ = appendHistory("oneshot", prompt, []string{command}, 2)
+				_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 2)
 				return &SilentError{Code: 2}
 			}
 		case risk.TierWrite:
 			if !dryRun && !yes && !confirmEnter() {
 				fmt.Println(dim("(aborted — rerun with --yes to skip prompts, or answer y/Enter to run.)"))
-				_ = appendHistory("oneshot", prompt, []string{command}, 1)
+				_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 1)
 				return &SilentError{Code: 1}
 			}
 		}
 		if dryRun {
 			fmt.Println(dim("⊘ dry-run — not executed"))
 			blank()
-			_ = appendHistory("oneshot", prompt, []string{command}, 0)
+			_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, 0)
 			return nil
 		}
 		t0exec := time.Now()
@@ -211,6 +228,7 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		fmt.Println(dim(fmt.Sprintf("(exit %d · %s)", res.ExitCode, time.Since(t0exec).Round(time.Millisecond))))
 		blank()
 		redacted := risk.Redact(res.Output)
+		taskOuts[outIdx] = res.Output
 		steps = append(steps, llm.Step{Cmd: command, Exit: res.ExitCode, Digest: llm.DigestOutput(redacted), Note: reply.Message})
 		pendingVerify = tier == risk.TierWrite || tier == risk.TierDestr
 		enforceOnce = true
@@ -218,12 +236,12 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		if sessionCap > 80*1024 {
 			res.Output = res.Output[:80*1024] + "\n…[session cap]…"
 		}
-		userCtx = llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, turn+1, maxTurns, res.Output, res.ExitCode, pendingVerify)
+		userCtx = llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, prev, turn+1, maxTurns, res.Output, res.ExitCode, pendingVerify)
 		if doneFirst && !(pendingVerify && enforceOnce && turn < maxTurns) {
 			if strings.TrimSpace(reply.Message) != "" {
 				printAnswer(reply.Message, width)
 			}
-			_ = appendHistory("oneshot", prompt, []string{command}, res.ExitCode)
+			_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, res.ExitCode)
 			return nil
 		}
 		if doneFirst {
@@ -235,7 +253,7 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		}
 		if turn == maxTurns {
 			fmt.Println(dim("(max-turns reached)"))
-			_ = appendHistory("oneshot", prompt, []string{command}, res.ExitCode)
+			_ = appendHistory("oneshot", prompt, taskCmds, taskOuts, res.ExitCode)
 			return nil
 		}
 	}

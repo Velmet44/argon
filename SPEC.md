@@ -32,7 +32,7 @@ argon version
 ### 2.1 `argon "prompt"` — one-shot agent loop
 
 Flow (streaming by default):
-1. Collect context (Sec 5). Init agent `cwd_state` = detected cwd. Always load last 5 turns from own `history.jsonl` even with `--history` off.
+1. Collect context (Sec 5). Init agent `cwd_state` = detected cwd. Load PREVIOUS TASKS from `history.jsonl` when `[history].remember_turns` (default on) + shell history file when `shell_history` (default on, `--history` overrides per-run).
 2. LLM call with `stream:true` (Sec 6.1) with system prompt + user prompt.
 3. Stream deltas live to spinner line, accumulate full text, parse JSON on `[DONE]` (Sec 6). Either `done:true` with final message, or `command` to run. Never execute partial JSON. On DONE, clear spinner line and re-render only `thought` (dim) + command block (yellow) — never show raw JSON unless `--verbose`.
 4. Print thought (dim, streamed) + command (styled) + risk tier, enforce policy (Sec 7, deny-first on command+args).
@@ -47,8 +47,8 @@ Flags:
 --max-turns int       # default 8, max 20
 --llm-timeout int     # seconds per LLM turn, default 90
 --exec-timeout int    # seconds per command, default 60
---history             # include shell history file in context (OFF by default, privacy)
---history-limit int   # last N history entries, default 50, max 200
+--history             # include shell history file in context (default from history.shell_history)
+--history-limit int   # last N shell history entries (default from history.shell_history_limit)
 --yes/-y              # auto-confirm WRITE (never DESTRUCTIVE)
 --force               # required + type-YES double-confirm for DESTRUCTIVE, otherwise reject
 --dry-run             # plan only, never execute
@@ -86,23 +86,24 @@ Single source of truth with `argon config`: both read/write same `config.go` str
 
 1. Provider & Auth: preset select + `baseURL` + `apiKey` (masked input, env-var first / file second, 0600; OS keyring in v0.2) + `model` (free-text) + Test button.
 2. Execution & Safety: default policy `auto-read|confirm-write`, allow `--yes` behavior, destructive mode `double-confirm` (locked in v0.1, visible but not changeable to weaker), blocklist preview, `--llm-timeout` + `--exec-timeout`.
-3. Defaults: default provider/model, default shell, default max-turns, timeouts, `--history` default on/off, history-limit, `--stream` default.
+3. Defaults: default provider/model, default shell, max-turns, timeouts, history memory (remember on/off + limits, shell-history on/off + limit), `--stream` default.
 4. Appearance: color on/off, verbose default, spinner, compact vs detailed explanations.
 5. Advanced: config path, `history.jsonl` path + Clear, Export/Import, Reset to defaults, Check upgrade (disabled message when managed install).
 
 Keys: Tab sections, arrows/Enter edit, Ctrl+S save, Esc back (prompt if dirty), `argon config list` masks secrets as `***` unless `--show` is passed.
 
-## 3. History flag (`--history`)
+## 3. History (`--history` flag + `[history]` memory)
 
-- Default OFF. When ON, include shell history FILE only (v0.1, no scrollback/output capture). Own `history.jsonl` last 5 turns are always sent (Sec 5) regardless of this flag.
+- Own past tasks are stored per finished task in `~/.argon/history.jsonl` (`{ts,mode,prompt,commands,outputs,exit}`), outputs redacted + truncated per task, file pruned to `file_max` lines. `argon history --clear` wipes it.
+- `[history]` defaults: `remember_turns=true` (last `remember_limit=5` tasks re-sent as PREVIOUS TASKS), `remember_output_chars=800` per task, `shell_history=true` (PSReadLine/bash file, `shell_history_limit=50`, no output capture), `file_max=200`.
+- `defaults.history/history_limit` are legacy aliases of `history.shell_history/shell_history_limit` (migrated on load when `[history]` is absent).
 - Sources (open read-only + retry on lock, UTF-8 with replacement):
   - Windows PowerShell 5.1: `%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt`
   - PowerShell 7 Win: `%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt` (same) or `~/.local/share/powershell/PSReadLine/ConsoleHost_history.txt` if XDG
   - PowerShell 7 Linux: `~/.local/share/powershell/PSReadLine/ConsoleHost_history.txt`
   - bash: `~/.bash_history`, zsh: `~/.zsh_history` (parse `: epoch:0;cmd` format)
-- Take last `--history-limit` lines, dedup consecutive, strip secrets via regex (`(?i)(api[_-]?key|token|passwd|secret)\s*[:=].*` → `[REDACTED]`), truncate each to 500 chars, total ≤8k chars.
-- In REPL, `/clear` clears session turns; file history still included on next turn if history=on (document this). `argon history --clear` wipes `~/.argon/history.jsonl` + offers to truncate shell history file (explicit only).
-- Never send history unless flag/session enabled. Show `+history(32)` indicator when active.
+- Shell entries: take last N lines, dedup consecutive, strip secrets via regex (`(?i)(api[_-]?key|token|passwd|secret)\s*[:=].*` → `[REDACTED]`), truncate each to 500 chars, total ≤8k chars.
+- In REPL, `/clear` clears session turns; file-backed PREVIOUS TASKS persist (they are finished work, not session state). `+history(N)` indicator shows the shell-file count when enabled.
 
 ## 4. Providers (Groq default + custom OpenAI-compatible)
 
@@ -138,7 +139,7 @@ Request: OpenAI chat-completions, temp 0.2, max_tokens 1024, `stream:true` by de
 
 - `ls_top`: top 30 entries, name + dir flag + size, no recursion, skip hidden unless prompt asks.
 - `cwd_state`: agent-owned cwd. Pure `cd/Set-Location/pushd/popd` lines update `cwd_state` locally (resolve `filepath.Abs`) and are NOT executed as subprocesses. All other commands exec with `Cmd.Dir = cwd_state`.
-- `own_last_turns`: always include last 5 from `history.jsonl` (prompt+commands+exit, outputs truncated to 500 chars each). `--history` file entries are additional, never replacement.
+- PREVIOUS TASKS: last `remember_limit` finished tasks from `history.jsonl` (prompt + commands + truncated outputs). REPL also folds them in on every turn, so restarts keep continuity.
 - Never send file contents unless command output contains them. Never send apiKeys (redact Sec 7).
 
 ## 6. Agent JSON contract (LLM returns ONLY this)
@@ -212,14 +213,14 @@ Order: deny-regex → destructive-list → write-list → read-only. Name-only m
 
 ## 9. Config / files
 
-- `~/.argon/config.toml` (0600 Unix, user-only ACL Windows), `~/.argon/history.jsonl` (append `{ts,mode,provider,model,prompt,commands,exit,llm_ms}`).
+- `~/.argon/config.toml` (0600 Unix, user-only ACL Windows), `~/.argon/history.jsonl` (append `{ts,mode,prompt,commands,outputs,exit}`).
 - `%APPDATA%\argon\` on Windows maps to same logical paths.
 - Precedence for secrets: env var → config file → settings prompt. `argon config list|get` masks as `***` unless `--show` passed. OS keyring (DPAPI/libsecret) is v0.2.
 - Example config:
 ```toml
 [llm]
 preset="groq"
-model="llama-3.3-70b-versatile"
+model="openai/gpt-oss-120b"
 base_url="https://api.groq.com/openai/v1"
 # api_key via env GROQ_API_KEY, not stored unless user types in settings
 
@@ -228,9 +229,15 @@ shell="auto"
 max_turns=8
 llm_timeout_sec=90
 exec_timeout_sec=60
-history=false
-history_limit=50
 confirm_write=true
+
+[history]
+remember_turns=true
+remember_limit=5
+remember_output_chars=800
+shell_history=true
+shell_history_limit=50
+file_max=200
 
 [ui]
 color=true
