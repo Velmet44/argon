@@ -111,6 +111,11 @@ func Save(cfg Config) error {
 	if err != nil {
 		return err
 	}
+	return SaveTo(cfg, p)
+}
+
+// SaveTo writes cfg to an explicit path (export).
+func SaveTo(cfg Config, p string) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
@@ -120,6 +125,15 @@ func Save(cfg Config) error {
 	}
 	defer f.Close()
 	return toml.NewEncoder(f).Encode(cfg)
+}
+
+// LoadFrom reads cfg from an explicit path (import).
+func LoadFrom(p string) (Config, error) {
+	cfg := Default()
+	if _, err := toml.DecodeFile(p, &cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
 // APIKey resolves env-var first, then config file.
