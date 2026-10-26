@@ -6,14 +6,32 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
-var interactiveDeny = []string{"vim", "nano", "ssh", "less", "more", "top", "passwd", "su ", "telnet"}
+var interactiveDeny = []string{
+	"vim", "vi", "nvim", "emacs", "nano", "code", "notepad",
+	"ssh", "scp", "sftp", "ftp", "telnet",
+	"less", "more", "most", "top", "htop", "btop", "watch",
+	"passwd", "su", "tail",
+}
+
+// EncodePowerShell returns base64(UTF-16LE(cmd)) for -EncodedCommand.
+// Avoids all $/`/quote interpolation when passing through -Command.
+func EncodePowerShell(cmd string) string {
+	u := utf16.Encode([]rune(cmd))
+	b := make([]byte, 0, len(u)*2)
+	for _, v := range u {
+		b = append(b, byte(v), byte(v>>8))
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
 
 func IsInteractive(cmd string) bool {
 	l := strings.ToLower(strings.TrimSpace(cmd))
@@ -60,10 +78,7 @@ func Run(ctx context.Context, shell, cmd, dir string, timeout time.Duration, onC
 		if _, err := exec.LookPath(bin); err != nil && runtime.GOOS == "windows" {
 			bin = "powershell"
 		}
-		// -EncodedCommand avoids $/quote interpolation bugs; for short
-		// commands -Command is fine and keeps logs readable. Use -Command here,
-		// runner writes exact string to transcript first (caller does that).
-		c = exec.CommandContext(ctx, bin, "-NoProfile", "-NonInteractive", "-Command", cmd)
+		c = exec.CommandContext(ctx, bin, "-NoProfile", "-NonInteractive", "-EncodedCommand", EncodePowerShell(cmd))
 	default:
 		c = exec.CommandContext(ctx, "bash", "-lc", cmd)
 	}
