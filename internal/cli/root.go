@@ -18,6 +18,8 @@ func NewRootCmd() *cobra.Command {
 Advanced REPL:  argon (no args)
 Settings TUI:   argon settings`,
 		Args: cobra.ArbitraryArgs,
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			c, err := config.Load()
 			if err != nil {

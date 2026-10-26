@@ -45,12 +45,11 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 	if useHist {
 		hist = xcontext.ReadHistory(limit)
 	}
-	// TTY gets the fullscreen runner (mouse, collapsible thoughts, color
-	// system). Pipes keep the plain streaming printer below.
-	if isTTY() {
-		return tui.RunOneShotTUI(cfg, ci.OS, shell, ci.CWD, ci.LsTop, hist, prompt, dryRun, yes, force)
-	}
-	fmt.Printf("◈ argon (%s/%s) %s\n", ci.OS, shell, dim(fmt.Sprintf("+history(%d)", len(hist))))
+	width := tui.TermWidth()
+	fmt.Printf("%s %s\n", dim("◈ argon"), dim(fmt.Sprintf("· %s/%s", ci.OS, shell)+fmt.Sprintf("  +history(%d)", len(hist))))
+	blank()
+	printBlock(tui.PromptEcho(cfg.UI.Color, prompt, width))
+	blank()
 
 	preset := llm.Lookup(cfg.LLM.Preset)
 	baseURL := cfg.LLM.BaseURL
@@ -87,37 +86,51 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 	for turn := 1; turn <= maxTurns; turn++ {
 		t0 := time.Now()
 		raw, err := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.SystemPrompt, llmTimeout, userCtx)
+		llmDur := time.Since(t0)
 		if err != nil {
-			return fmt.Errorf("llm turn %d failed after %s: %v", turn, time.Since(t0).Round(time.Millisecond), err)
+			lines := llmHint(err)
+			if cfg.UI.Verbose {
+				lines = append(lines, "detail: "+err.Error())
+			}
+			printErrBox(fmt.Sprintf("llm request failed · turn %d", turn), lines, width)
+			_ = appendHistory("oneshot", prompt, nil, 1)
+			return &SilentError{Code: 1}
 		}
 		if cfg.UI.Verbose {
-			fmt.Println(dim(fmt.Sprintf("[turn %d llm %s raw %d bytes]", turn, time.Since(t0).Round(time.Millisecond), len(raw))))
-			fmt.Println(dim("raw: " + truncateRaw(raw, 2000)))
+			fmt.Println(dim(fmt.Sprintf("[turn %d · llm %s · raw %d bytes · model %s]", turn, llmDur.Round(time.Millisecond), len(raw), model)))
 		}
 		reply, err := llm.ParseReply(raw)
 		if err != nil {
 			// one repair retry: system stays, user = repair instruction + bad output
 			raw2, err2 := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.SystemPrompt, llmTimeout, llm.RepairPrompt+"\n\nBAD OUTPUT:\n"+raw)
 			if err2 != nil {
-				return fmt.Errorf("could not parse model JSON (use --verbose): %v", err)
-			}
-			if cfg.UI.Verbose {
-				fmt.Println(dim("repair raw: " + truncateRaw(raw2, 2000)))
+				lines := []string{"The model replied with non-JSON.", "Retry — usually succeeds on the next run."}
+				if cfg.UI.Verbose {
+					lines = append(lines, "detail: "+err.Error())
+				}
+				printErrBox("could not parse model JSON", lines, width)
+				_ = appendHistory("oneshot", prompt, nil, 1)
+				return &SilentError{Code: 1}
 			}
 			reply, err = llm.ParseReply(raw2)
 			if err != nil {
-				return fmt.Errorf("could not parse model JSON (use --verbose): %v", err)
+				lines := []string{"The model replied with non-JSON twice.", "Retry, or switch model in `argon settings`."}
+				if cfg.UI.Verbose {
+					lines = append(lines, "detail: "+err.Error())
+				}
+				printErrBox("could not parse model JSON", lines, width)
+				_ = appendHistory("oneshot", prompt, nil, 1)
+				return &SilentError{Code: 1}
 			}
 		}
-		if reply.Thought != "" {
-			fmt.Println(dim("◈ "+reply.Thought))
-		}
+		printThoughtBox(turn, llmDur, reply.Thought, width)
+		blank()
 		if reply.Command == nil || strings.TrimSpace(*reply.Command) == "" {
-			fmt.Println(reply.Message)
-			return appendHistory("oneshot", prompt, nil, 0)
-		}
-		if reply.Done {
-			fmt.Println(dim("(final step)"))
+			if strings.TrimSpace(reply.Message) != "" {
+				printAnswer(reply.Message, width)
+			}
+			_ = appendHistory("oneshot", prompt, nil, 0)
+			return nil
 		}
 		doneFirst := reply.Done
 		command := strings.TrimSpace(*reply.Command)
@@ -125,10 +138,15 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		if execx.IsPureCD(command) {
 			cwdState = resolveCD(cwdState, command)
 			userCtx = fmt.Sprintf("(cd → %s)\n%s", cwdState, userCtx)
-			fmt.Println(boldYellow("$ " + command + "  (cwd → " + cwdState + ")"))
+			printCommand(command, "cd", width)
+			fmt.Println(dim("cwd → " + cwdState))
+			blank()
 			if doneFirst {
-				fmt.Println(reply.Message)
-				return appendHistory("oneshot", prompt, []string{command}, 0)
+				if strings.TrimSpace(reply.Message) != "" {
+					printAnswer(reply.Message, width)
+				}
+				_ = appendHistory("oneshot", prompt, []string{command}, 0)
+				return nil
 			}
 			continue
 		}
@@ -137,45 +155,59 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 			disabled[id] = true
 		}
 		tier, why := risk.Classify(command, cfg.Risk.ExtraDeny, cfg.Risk.ExtraDestructive, disabled)
-		fmt.Println(boldYellow("$ " + command) + "  " + dim(fmt.Sprintf("[%s]", tier)))
+		printCommand(command, string(tier), width)
 		if cfg.UI.Verbose {
 			fmt.Println(dim("policy: " + why))
 		}
+		blank()
 		switch tier {
 		case risk.TierDeny:
-			fmt.Println("blocked: " + why)
-			return appendHistory("oneshot", prompt, []string{command}, 2)
+			printErrBox("blocked", []string{why, "If this is wrong, allowlist an exception in `argon settings` → Safety."}, width)
+			_ = appendHistory("oneshot", prompt, []string{command}, 2)
+			return &SilentError{Code: 2}
 		case risk.TierDestr:
-			if !force || !confirmYES("destructive — type YES to run: ") {
-				fmt.Println("needs --force + typed YES. Aborted.")
-				return appendHistory("oneshot", prompt, []string{command}, 2)
+			if !force || !confirmYES() {
+				printErrBox("destructive refused", []string{"Needs --force plus typing YES.", why}, width)
+				_ = appendHistory("oneshot", prompt, []string{command}, 2)
+				return &SilentError{Code: 2}
 			}
 		case risk.TierWrite:
-			if !dryRun && !yes && !confirmEnter("run? [Enter/y=yes, n=no] ") {
-				fmt.Println("aborted — rerun with --yes to skip prompts, or answer y/Enter to run.")
-				return appendHistory("oneshot", prompt, []string{command}, 1)
+			if !dryRun && !yes && !confirmEnter() {
+				fmt.Println(dim("(aborted — rerun with --yes to skip prompts, or answer y/Enter to run.)"))
+				_ = appendHistory("oneshot", prompt, []string{command}, 1)
+				return &SilentError{Code: 1}
 			}
 		}
 		if dryRun {
-			fmt.Println(dim("(dry-run, not executed)"))
-			return appendHistory("oneshot", prompt, []string{command}, 0)
+			fmt.Println(dim("⊘ dry-run — not executed"))
+			blank()
+			_ = appendHistory("oneshot", prompt, []string{command}, 0)
+			return nil
 		}
-		fmt.Println(dim("running…"))
+		t0exec := time.Now()
+		ew := newEdgeWriter(cfg.UI.Color, width)
 		res := execx.Run(cmd.Context(), shell, command, cwdState, execTimeout, func(chunk string) {
-			fmt.Print(chunk)
+			ew.Write(chunk)
 		})
+		ew.Flush()
+		fmt.Println(dim(fmt.Sprintf("(exit %d · %s)", res.ExitCode, time.Since(t0exec).Round(time.Millisecond))))
+		blank()
 		sessionCap += len(res.Output)
 		if sessionCap > 80*1024 {
 			res.Output = res.Output[:80*1024] + "\n…[session cap]…"
 		}
 		userCtx = fmt.Sprintf("command: %s\nexit: %d\noutput:\n%s", command, res.ExitCode, risk.Redact(res.Output))
 		if doneFirst {
-			fmt.Println(reply.Message)
-			return appendHistory("oneshot", prompt, []string{command}, res.ExitCode)
+			if strings.TrimSpace(reply.Message) != "" {
+				printAnswer(reply.Message, width)
+			}
+			_ = appendHistory("oneshot", prompt, []string{command}, res.ExitCode)
+			return nil
 		}
 		if turn == maxTurns {
 			fmt.Println(dim("(max-turns reached)"))
-			return appendHistory("oneshot", prompt, []string{command}, res.ExitCode)
+			_ = appendHistory("oneshot", prompt, []string{command}, res.ExitCode)
+			return nil
 		}
 	}
 	return nil
@@ -193,9 +225,13 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 	go llm.StreamChat(c, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user}, ch)
 	var sb strings.Builder
 	streamErr := error(nil)
-	showRaw := cfg.UI.Verbose && cfg.UI.Color && isTTY()
-	if !cfg.UI.Verbose {
-		fmt.Println(dim("thinking…"))
+	stopSpin := make(chan struct{})
+	spinDone := make(chan struct{})
+	spinning := !cfg.UI.Verbose && isTTY()
+	if spinning {
+		go thinkingSpinner(cfg.UI.Color, stopSpin, spinDone)
+	} else if !cfg.UI.Verbose {
+		fmt.Println(dim("◈ Thinking…"))
 	}
 	for ck := range ch {
 		if ck.Err != nil {
@@ -203,15 +239,15 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 			break
 		}
 		sb.WriteString(ck.Text)
-		if showRaw {
-			fmt.Print(dim(ck.Text))
-		}
 		if ck.Done {
 			break
 		}
 	}
-	if !cfg.UI.Verbose {
-		// thinking… already ended with newline; nothing to clear.
+	if spinning {
+		close(stopSpin)
+		<-spinDone
+	} else if !cfg.UI.Verbose {
+		// static line already printed; nothing to clear.
 	} else {
 		fmt.Println()
 	}
@@ -237,30 +273,30 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 	return sb.String(), nil
 }
 
-func truncateRaw(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
-}
-
-func confirmEnter(msg string) bool {
+func confirmEnter() bool {
 	if !isTTY() {
 		return false
 	}
-	fmt.Print(msg)
+	q := "? run? [y/Enter=yes · n=no] "
+	if cfg.UI.Color {
+		q = "\x1b[1;33m" + q + "\x1b[0m"
+	}
+	fmt.Print(q)
 	r := bufio.NewReader(os.Stdin)
 	s, _ := r.ReadString('\n')
 	s = strings.ToLower(strings.TrimSpace(s))
 	return s == "" || s == "y" || s == "yes"
 }
 
-func confirmYES(msg string) bool {
+func confirmYES() bool {
 	if !isTTY() {
 		return false
 	}
-	fmt.Print(msg)
+	q := "! destructive — type YES + Enter: "
+	if cfg.UI.Color {
+		q = "\x1b[1;31m" + q + "\x1b[0m"
+	}
+	fmt.Print(q)
 	r := bufio.NewReader(os.Stdin)
 	s, _ := r.ReadString('\n')
 	return strings.TrimSpace(s) == "YES"
@@ -273,9 +309,8 @@ func dim(s string) string {
 	return "\x1b[2;36m" + s + "\x1b[0m"
 }
 
-func boldYellow(s string) string {
-	if !cfg.UI.Color {
-		return s
-	}
-	return "\x1b[1;33m" + s + "\x1b[0m"
-}
+// SilentError carries a process exit code for failures that are already
+// rendered as boxes (main prints nothing further, cobra stays silent).
+type SilentError struct{ Code int }
+
+func (e *SilentError) Error() string { return fmt.Sprintf("exit %d", e.Code) }

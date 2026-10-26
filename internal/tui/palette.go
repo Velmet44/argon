@@ -16,10 +16,14 @@
 package tui
 
 import (
+	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wordwrap"
+	"golang.org/x/term"
 )
 
 // --- palette ---------------------------------------------------------------
@@ -200,5 +204,119 @@ func messageLine(color bool, text string, width int) []string {
 
 // thinkingLine renders the live "Thinking… Ns" indicator.
 func thinkingLine(color bool, elapsed string) string {
-	return stArgon(color).Render("◈ Thinking… "+elapsed)
+	return stArgon(color).Render("◈ Thinking… " + elapsed)
+}
+
+// --- shared plain-print blocks (sequential stdout, no viewport) ------------
+//
+// TermWidth is the box measure: real stdout width clamped to 40–100 so
+// transcripts stay readable on ultra-wide terminals and intact on narrow ones.
+func TermWidth() int {
+	w := 80
+	if cols, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && cols > 0 {
+		w = cols
+	} else if c := strings.TrimSpace(os.Getenv("COLUMNS")); c != "" {
+		var n int
+		if _, err := fmt.Sscanf(c, "%d", &n); err == nil && n > 0 {
+			w = n
+		}
+	}
+	return clampWidth(w)
+}
+
+func clampWidth(width int) int {
+	if width < 40 {
+		return 40
+	}
+	if width > 100 {
+		return 100
+	}
+	return width
+}
+
+func boxBorder(color bool) lipgloss.Style {
+	s := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	if color {
+		s = s.BorderForeground(cGrey)
+	}
+	return s
+}
+
+// ThoughtBoxLines renders the always-visible reasoning box:
+// title "◈ thought N · Ns", violet wrapped body, grey rounded border.
+func ThoughtBoxLines(color bool, n int, elapsed time.Duration, thought string, width int) []string {
+	w := clampWidth(width) - 4 // border (2) + padding (2)
+	title := stArgon(color).Render(fmt.Sprintf("◈ thought %d · %s", n, fmtSecs(elapsed)))
+	body := wrap(thought, w)
+	styled := make([]string, 0, len(body)+1)
+	styled = append(styled, title)
+	bs := stThoughtBody(color)
+	for _, l := range body {
+		styled = append(styled, bs.Render(l))
+	}
+	return strings.Split(boxBorder(color).Render(strings.Join(styled, "\n")), "\n")
+}
+
+// CommandLines renders "$ cmd [tier]" bold yellow with a yellow edge.
+// Long commands hard-wrap with a yellow "↳ " continuation (tier rides last).
+func CommandLines(color bool, cmd, tier string, width int) []string {
+	content := clampWidth(width) - 4 // "│ "(2) + "$ "(2)
+	chunks := wrap(cmd, content)
+	if len(chunks) == 0 {
+		chunks = []string{""}
+	}
+	out := make([]string, 0, len(chunks))
+	head := stCmd(color)
+	for i, c := range chunks {
+		var line string
+		if i == 0 {
+			line = head.Render("$ " + c)
+		} else {
+			line = head.Render("↳ " + c)
+		}
+		if i == len(chunks)-1 {
+			line += "  " + stMeta(color).Render("["+tier+"]")
+		}
+		out = append(out, line)
+	}
+	return edge(out, color, stEdgeCmd(color))
+}
+
+// ErrBoxLines renders a red bordered failure box with title + detail lines.
+func ErrBoxLines(color bool, title string, lines []string, width int) []string {
+	w := clampWidth(width) - 4
+	titleLine := stErr(color).Render("✖ " + title)
+	styled := []string{titleLine}
+	for _, l := range lines {
+		styled = append(styled, wrap(l, w)...)
+	}
+	s := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	if color {
+		s = s.BorderForeground(cRed)
+	}
+	return strings.Split(s.Render(strings.Join(styled, "\n")), "\n")
+}
+
+// AnswerLines renders the final answer with a green tick.
+func AnswerLines(color bool, text string, width int) []string {
+	return messageLine(color, text, width)
+}
+
+// MetaLine renders a dim provenance note: "(exit 0 · 0.4s)".
+func MetaLine(color bool, text string) string {
+	return stMeta(color).Render(text)
+}
+
+// PromptEcho renders "you: <prompt>" with a blue prompt word.
+func PromptEcho(color bool, prompt string, width int) []string {
+	head := stHead(color).Render("you: ")
+	out := []string{}
+	for i, l := range wrap(prompt, clampWidth(width)-len("you: ")) {
+		if i == 0 {
+			out = append(out, head+l)
+		} else {
+			out = append(out, "    "+l)
+		}
+	}
+	return out
 }
