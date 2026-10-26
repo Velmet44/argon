@@ -46,6 +46,8 @@ type sessTurn struct {
 	Prompt   string
 	Commands []string
 	Exit     int
+	Digest   string // local output-shape summary (never model-written)
+	Note     string // model's own prior message for this step
 }
 
 type replModel struct {
@@ -76,6 +78,11 @@ type replModel struct {
 	pendingWhy string
 	pendingDone bool
 	pendingMsg  string
+	lastTier  string // tier of the last classified command (for verify tracking)
+	expectVerify bool // previous turn modified the system; next must verify
+	enforceOnce bool // one engine-forced verification turn allowed per write
+	lastDigest string // set before recordStep
+	lastNote   string
 	sess      []sessTurn
 	curOut    *rBlock // live command output block
 
@@ -629,29 +636,51 @@ func (m *replModel) startPrompt(p string) {
 	m.prompt = p
 	m.turn = 0
 	m.pendingDone, m.pendingMsg = false, ""
+	m.lastDigest, m.lastNote = "", ""
+	m.expectVerify, m.lastTier, m.enforceOnce = false, "", false
 	m.curOut = nil
 	m.addEcho(p)
-	m.startLLMTurn(m.buildUserCtx(p, ""))
+	m.startLLMTurn(m.buildFreshCtx())
 }
 
-func (m *replModel) buildUserCtx(prompt, extra string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "os=%s shell=%s cwd=%s\nls: %s", m.osStr, m.shell, m.cwd, strings.Join(m.lsTop, ", "))
-	if m.cfg.Defaults.History && len(m.histFile) > 0 {
-		b.WriteString("\nrecent shell history:\n" + strings.Join(m.histFile, "\n"))
+func (m *replModel) buildFreshCtx() string {
+	return m.buildCtx("", 0, false)
+}
+
+// buildCtx assembles one self-contained user message: original task verbatim
+// every turn, STEPS ledger from local digests + prior notes, latest output.
+func (m *replModel) buildCtx(out string, exitCode int, hasOut bool) string {
+	turns := m.sess
+	if len(turns) > 5 {
+		turns = turns[len(turns)-5:]
 	}
-	// own last turns always (amnesia-proof)
-	for _, t := range m.sess {
-		if len(m.sess) > 5 {
-			continue
-		}
-		b.WriteString(fmt.Sprintf("\n[prev prompt=%q commands=%v exit=%d]", t.Prompt, t.Commands, t.Exit))
+	steps := make([]llm.Step, 0, len(turns))
+	for _, t := range turns {
+		steps = append(steps, llm.Step{
+			Cmd:    strings.Join(t.Commands, " ; "),
+			Exit:   t.Exit,
+			Digest: t.Digest,
+			Note:   t.Note,
+		})
 	}
-	b.WriteString("\n\ntask: " + risk.Redact(prompt))
-	if extra != "" {
-		b.WriteString("\n" + extra)
+	var hist []string
+	if m.cfg.Defaults.History {
+		hist = m.histFile
 	}
-	return b.String()
+	return llm.BuildUserMessage(m.shell, m.osStr, m.cwd, strings.Join(m.lsTop, ", "),
+		risk.Redact(m.prompt), hist, steps, m.turn+1, m.maxTurns(), out, exitCode, m.expectVerify)
+}
+
+// recordStep appends one ledger entry (digest + note set by the caller first).
+func (m *replModel) recordStep(cmds []string, exit int) {
+	m.sess = append(m.sess, sessTurn{
+		Prompt: m.prompt, Commands: cmds, Exit: exit,
+		Digest: m.lastDigest, Note: m.lastNote,
+	})
+	m.lastDigest, m.lastNote = "", ""
+	if len(m.sess) > 20 {
+		m.sess = m.sess[len(m.sess)-20:]
+	}
 }
 
 func (m *replModel) llmReq() (baseURL, model, key string, preset llm.Preset) {
@@ -761,13 +790,19 @@ func (m *replModel) handleLLMDone(raw string) {
 	}
 	reply, err := llm.ParseReply(raw)
 	if err != nil {
-		// one repair retry inline (blocking is fine, short)
+		// one repair retry inline (blocking is fine, short): same system,
+		// assistant echoes the bad reply, user carries the concrete error
 		baseURL, model, key, _ := m.llmReq()
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
+		bad := raw
+		if len(bad) > 600 {
+			bad = bad[:600]
+		}
 		raw2, err2 := llm.CompleteOnce(ctx, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model,
 			System:  llm.SystemPrompt,
-			User:    llm.RepairPrompt + "\n\nBAD OUTPUT:\n" + raw,
+			History: []llm.Msg{{Role: "assistant", Content: bad}},
+			User:    llm.RepairPromptFor(err.Error()),
 			Timeout: 60 * time.Second})
 		if err2 != nil {
 			freeze("(parse failed)", false)
@@ -799,30 +834,57 @@ func (m *replModel) handleLLMDone(raw string) {
 	}
 	doneFirst := reply.Done
 	m.pendingDone, m.pendingMsg = doneFirst, reply.Message
+	m.lastTier = ""
 	command := strings.TrimSpace(*reply.Command)
 	if execx.IsPureCD(command) {
 		m.cwd = tuiResolveCD(m.cwd, command)
 		m.addCmd(command, "cd")
 		m.addMeta("cwd → " + m.cwd)
-		m.userCtx = fmt.Sprintf("(cd → %s)\n%s", m.cwd, m.userCtx)
+		m.lastDigest = "cwd now " + m.cwd
+		m.lastNote = reply.Message
 		m.render()
 		if doneFirst {
 			if strings.TrimSpace(reply.Message) != "" {
 				m.addMsg(reply.Message)
 			}
+			m.recordStep([]string{command}, 0)
 			m.finishPrompt([]string{command}, 0)
 			m.m = modeInput
 			m.input.Focus()
 			m.render()
 			return
 		}
-		m.nextTurn("(cd ok)")
+		m.recordStep([]string{command}, 0)
+		m.nextTurn()
 		return
 	}
 	tier, why := risk.Classify(command, m.cfg.Risk.ExtraDeny, m.cfg.Risk.ExtraDestructive, disabledSet(m.cfg.Risk.Disabled))
+	m.lastTier = string(tier)
 	m.addCmd(command, string(tier))
 	if m.cfg.UI.Verbose {
 		m.addMeta("policy: " + why)
+	}
+	if !reply.Run {
+		// explicit model signal: display the plan, never execute it
+		m.addMeta("(model asked not to run — displaying only)")
+		if strings.TrimSpace(reply.Message) != "" {
+			m.addMsg(reply.Message)
+		}
+		m.finishPrompt([]string{command}, 0)
+		m.m = modeInput
+		m.input.Focus()
+		m.render()
+		return
+	}
+	if !reply.Run {
+		// explicit model signal: display the plan, never execute it
+		m.addMeta("(model asked not to run — displaying only)")
+		m.recordStep([]string{command}, 0)
+		m.finishPrompt([]string{command}, 0)
+		m.m = modeInput
+		m.input.Focus()
+		m.render()
+		return
 	}
 	switch tier {
 	case risk.TierDeny:
@@ -912,16 +974,26 @@ func (m *replModel) runPending() {
 	}()
 }
 
+// maxTurns centralizes the default so step numbering stays consistent.
+func (m *replModel) maxTurns() int {
+	if m.cfg.Defaults.MaxTurns <= 0 {
+		return 8
+	}
+	return m.cfg.Defaults.MaxTurns
+}
+
 func (m *replModel) handleExecDone(msg execDoneMsg) {
 	m.addMeta(fmt.Sprintf("(exit %d)", msg.res.ExitCode))
 	m.render()
 	redacted := risk.Redact(msg.res.Output)
-	m.sess = append(m.sess, sessTurn{Prompt: m.prompt, Commands: []string{msg.command}, Exit: msg.res.ExitCode})
-	if len(m.sess) > 20 {
-		m.sess = m.sess[len(m.sess)-20:]
-	}
+	m.lastDigest = llm.DigestOutput(redacted)
+	m.lastNote = m.pendingMsg
+	m.recordStep([]string{msg.command}, msg.res.ExitCode)
+	m.expectVerify = m.lastTier == "write" || m.lastTier == "destructive"
+	m.enforceOnce = true
 	m.curOut = nil
-	if m.pendingDone {
+	m.userCtx = m.buildCtx(redacted, msg.res.ExitCode, true)
+	if m.pendingDone && !(m.expectVerify && m.enforceOnce && m.turn+1 < m.maxTurns()) {
 		m.pendingDone = false
 		if strings.TrimSpace(m.pendingMsg) != "" {
 			m.addMsg(m.pendingMsg)
@@ -932,6 +1004,14 @@ func (m *replModel) handleExecDone(msg execDoneMsg) {
 		m.render()
 		return
 	}
+	if m.pendingDone {
+		// engine backstop for rule 7: one enforced verification turn even
+		// though the model said done — the next message demands it
+		m.enforceOnce = false
+		m.pendingDone = false
+		m.addMeta("(verification required — confirming the write first)")
+		m.render()
+	}
 	m.turn++
 	if m.turn >= m.cfg.Defaults.MaxTurns {
 		m.addMeta("(max-turns reached)")
@@ -941,7 +1021,6 @@ func (m *replModel) handleExecDone(msg execDoneMsg) {
 		m.render()
 		return
 	}
-	m.userCtx = fmt.Sprintf("command: %s\nexit: %d\noutput:\n%s", msg.command, msg.res.ExitCode, redacted)
 	m.m = modeStreaming
 	m.render()
 	m.startLLMTurnContinue()
@@ -1005,7 +1084,7 @@ func (m *replModel) startLLMTurnContinue() {
 	}()
 }
 
-func (m *replModel) nextTurn(note string) {
+func (m *replModel) nextTurn() {
 	m.turn++
 	if m.turn >= m.cfg.Defaults.MaxTurns {
 		m.addMeta("(max-turns reached)")
@@ -1014,12 +1093,11 @@ func (m *replModel) nextTurn(note string) {
 		m.input.Focus()
 		return
 	}
-	_ = note
+	m.userCtx = m.buildCtx("(directory changed, no output)", 0, true)
 	m.startLLMTurnContinue()
 }
 
 func (m *replModel) finishPrompt(cmds []string, exit int) {
-	m.sess = append(m.sess, sessTurn{Prompt: m.prompt, Commands: cmds, Exit: exit})
 	m.m = modeInput
 	m.status = ""
 	m.input.Focus()

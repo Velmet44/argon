@@ -181,7 +181,9 @@ func readSnippet(resp *http.Response, n int) string {
 }
 
 // ParseReply validates the accumulated stream text as AgentReply.
-// Tolerates ```json fences and leading/trailing prose: extracts first {...}.
+// Tolerates ```json fences and leading/trailing prose: extracts the first
+// BALANCED {...} object (brace-aware, string-aware) so nested braces in
+// commands (e.g. PowerShell @{...}) don't break extraction.
 func ParseReply(s string) (AgentReply, error) {
 	var r AgentReply
 	s = strings.TrimSpace(s)
@@ -189,8 +191,8 @@ func ParseReply(s string) (AgentReply, error) {
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
-	if i, j := strings.Index(s, "{"), strings.LastIndex(s, "}"); i >= 0 && j > i {
-		s = s[i : j+1]
+	if obj, ok := extractBalanced(s); ok {
+		s = obj
 	}
 	if err := json.Unmarshal([]byte(s), &r); err != nil {
 		return r, err
@@ -199,4 +201,41 @@ func ParseReply(s string) (AgentReply, error) {
 		return r, fmt.Errorf("empty reply")
 	}
 	return r, nil
+}
+
+// extractBalanced returns the first {...} with matched braces, skipping
+// over "..." strings (with \ escapes). Reports false when unbalanced.
+func extractBalanced(s string) (string, bool) {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return "", false
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if esc {
+				esc = false
+			} else if c == '\\' {
+				esc = true
+			} else if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1], true
+			}
+		}
+	}
+	return "", false
 }

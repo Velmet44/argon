@@ -76,16 +76,17 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		execTimeout = 60 * time.Second
 	}
 
-	userCtx := fmt.Sprintf("os=%s shell=%s cwd=%s\nls: %s", ci.OS, shell, cwdState, strings.Join(ci.LsTop, ", "))
-	if len(hist) > 0 {
-		userCtx += "\nrecent shell history:\n" + strings.Join(hist, "\n")
-	}
-	userCtx += "\n\ntask: " + risk.Redact(prompt)
+	lsStr := strings.Join(ci.LsTop, ", ")
+	safePrompt := risk.Redact(prompt)
+	var steps []llm.Step
+	pendingVerify := false
+	enforceOnce := false
+	userCtx := llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, 1, maxTurns, "", 0, false)
 
 	sessionCap := 0
 	for turn := 1; turn <= maxTurns; turn++ {
 		t0 := time.Now()
-		raw, err := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.SystemPrompt, llmTimeout, userCtx)
+		raw, err := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.SystemPrompt, llmTimeout, userCtx, nil)
 		llmDur := time.Since(t0)
 		if err != nil {
 			lines := llmHint(err)
@@ -101,8 +102,14 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		}
 		reply, err := llm.ParseReply(raw)
 		if err != nil {
-			// one repair retry: system stays, user = repair instruction + bad output
-			raw2, err2 := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.SystemPrompt, llmTimeout, llm.RepairPrompt+"\n\nBAD OUTPUT:\n"+raw)
+			// one repair retry: same system, assistant echoes the bad reply
+			// (truncated), user carries the concrete parser error
+			bad := raw
+			if len(bad) > 600 {
+				bad = bad[:600]
+			}
+			raw2, err2 := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.SystemPrompt, llmTimeout,
+				llm.RepairPromptFor(err.Error()), []llm.Msg{{Role: "assistant", Content: bad}})
 			if err2 != nil {
 				lines := []string{"The model replied with non-JSON.", "Retry — usually succeeds on the next run."}
 				if cfg.UI.Verbose {
@@ -137,7 +144,8 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		// pure cd → local state update, no exec
 		if execx.IsPureCD(command) {
 			cwdState = resolveCD(cwdState, command)
-			userCtx = fmt.Sprintf("(cd → %s)\n%s", cwdState, userCtx)
+			steps = append(steps, llm.Step{Cmd: command, Exit: 0, Digest: "cwd now " + cwdState, Note: reply.Message})
+			userCtx = llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, turn+1, maxTurns, "", 0, pendingVerify)
 			printCommand(command, "cd", width)
 			fmt.Println(dim("cwd → " + cwdState))
 			blank()
@@ -160,6 +168,16 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 			fmt.Println(dim("policy: " + why))
 		}
 		blank()
+		if !reply.Run {
+			// explicit model signal: display the plan, never execute it
+			fmt.Println(dim("(model asked not to run — displaying only)"))
+			blank()
+			if strings.TrimSpace(reply.Message) != "" {
+				printAnswer(reply.Message, width)
+			}
+			_ = appendHistory("oneshot", prompt, []string{command}, 0)
+			return nil
+		}
 		switch tier {
 		case risk.TierDeny:
 			printErrBox("blocked", []string{why, "If this is wrong, allowlist an exception in `argon settings` → Safety."}, width)
@@ -192,17 +210,28 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 		ew.Flush()
 		fmt.Println(dim(fmt.Sprintf("(exit %d · %s)", res.ExitCode, time.Since(t0exec).Round(time.Millisecond))))
 		blank()
+		redacted := risk.Redact(res.Output)
+		steps = append(steps, llm.Step{Cmd: command, Exit: res.ExitCode, Digest: llm.DigestOutput(redacted), Note: reply.Message})
+		pendingVerify = tier == risk.TierWrite || tier == risk.TierDestr
+		enforceOnce = true
 		sessionCap += len(res.Output)
 		if sessionCap > 80*1024 {
 			res.Output = res.Output[:80*1024] + "\n…[session cap]…"
 		}
-		userCtx = fmt.Sprintf("command: %s\nexit: %d\noutput:\n%s", command, res.ExitCode, risk.Redact(res.Output))
-		if doneFirst {
+		userCtx = llm.BuildUserMessage(shell, ci.OS, cwdState, lsStr, safePrompt, hist, steps, turn+1, maxTurns, res.Output, res.ExitCode, pendingVerify)
+		if doneFirst && !(pendingVerify && enforceOnce && turn < maxTurns) {
 			if strings.TrimSpace(reply.Message) != "" {
 				printAnswer(reply.Message, width)
 			}
 			_ = appendHistory("oneshot", prompt, []string{command}, res.ExitCode)
 			return nil
+		}
+		if doneFirst {
+			// engine backstop for rule 7: one enforced verification turn even
+			// though the model said done — the next message demands it
+			enforceOnce = false
+			fmt.Println(dim("(verification required — confirming the write first)"))
+			blank()
 		}
 		if turn == maxTurns {
 			fmt.Println(dim("(max-turns reached)"))
@@ -213,16 +242,41 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout time.Duration, user string) (string, error) {
+func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout time.Duration, user string, hist []llm.Msg) (string, error) {
+	// spec: one backoff retry (2s) on 429/5xx, then surface the error
+	raw, err := llmTurnOnce(ctx, baseURL, key, model, system, timeout, user, hist)
+	if err != nil && isRateOrServerErr(err) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(2 * time.Second):
+		}
+		if ctx.Err() == nil {
+			return llmTurnOnce(ctx, baseURL, key, model, system, timeout, user, hist)
+		}
+	}
+	return raw, err
+}
+
+func isRateOrServerErr(err error) bool {
+	msg := err.Error()
+	for _, s := range []string{" 429", " 500", " 502", " 503", "rate_limit", "Rate limit", "rate_limit_exceeded"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func llmTurnOnce(ctx context.Context, baseURL, key, model, system string, timeout time.Duration, user string, hist []llm.Msg) (string, error) {
 	if !cfg.UI.Stream {
 		c, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		return llm.CompleteOnce(c, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user, Timeout: timeout})
+		return llm.CompleteOnce(c, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, History: hist, User: user, Timeout: timeout})
 	}
 	c, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ch := make(chan llm.Chunk, 64)
-	go llm.StreamChat(c, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user}, ch)
+	go llm.StreamChat(c, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, History: hist, User: user}, ch)
 	var sb strings.Builder
 	streamErr := error(nil)
 	stopSpin := make(chan struct{})
@@ -255,7 +309,7 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 		// SSE failed: single non-stream retry, surface combined error if it also fails
 		c2, cancel2 := context.WithTimeout(ctx, timeout)
 		defer cancel2()
-		raw, err := llm.CompleteOnce(c2, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user, Timeout: timeout})
+		raw, err := llm.CompleteOnce(c2, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, History: hist, User: user, Timeout: timeout})
 		if err != nil {
 			return "", fmt.Errorf("stream failed (%v) + retry failed (%v)", streamErr, err)
 		}
@@ -268,7 +322,7 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 		// empty stream (provider sent no deltas): one non-stream retry
 		c2, cancel2 := context.WithTimeout(ctx, timeout)
 		defer cancel2()
-		return llm.CompleteOnce(c2, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user, Timeout: timeout})
+		return llm.CompleteOnce(c2, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, History: hist, User: user, Timeout: timeout})
 	}
 	return sb.String(), nil
 }

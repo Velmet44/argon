@@ -49,6 +49,8 @@ func DefaultRules() []Rule {
 		{ID: "deny-nc-bind", Tier: TierDeny, Re: must(`\bnc\b.*-l|\bncat\b.*-l|/dev/tcp/.*/0`), Reason: "reverse/bind shell"},
 		// ---- DESTRUCTIVE: double-confirm (type YES + --force) ----
 		{ID: "destr-rm-rf", Tier: TierDestr, Re: must(`rm\s+-[a-z]*r[a-z]*f|remove-item\s+.*-recurse.*-force`), Reason: "recursive force delete"},
+		{ID: "destr-rm-glob", Tier: TierDestr, Re: must(`\brm\s+[^\n]*[*?]`), Reason: "wildcard delete (many files at once)"},
+		{ID: "destr-remove-item", Tier: TierDestr, Re: must(`\|\s*[^\n|]*remove-item|remove-item\s+[^\n]*(-recurse|[*?])`), Reason: "bulk PowerShell delete (wildcard, recurse, or pipeline)"},
 		{ID: "destr-git-hard", Tier: TierDestr, Re: must(`git\s+(reset\s+--hard|push\s+--force|push\s+-f|clean\s+-fd)`), Reason: "history-destroying git op"},
 		{ID: "destr-pkg-remove", Tier: TierDestr, Re: must(`apt\s+(remove|purge)|pip\s+uninstall\s+-y|npm\s+uninstall\s+-g|docker\s+system\s+prune`), Reason: "package/data removal"},
 		{ID: "destr-rm-config", Tier: TierDestr, Re: must(`rm\s+-r\s+~\/\.(config|local|ssh)`), Reason: "dot-config wipe"},

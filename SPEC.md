@@ -154,9 +154,31 @@ Request: OpenAI chat-completions, temp 0.2, max_tokens 1024, `stream:true` by de
 }
 ```
 
-Rules in system prompt: single shell LINE per turn (pipes allowed, e.g. `ls -lh | sort -k5 -h`); avoid `&&`/`;` multi-step chains unless trivial — prefer one step per turn so output can be observed. Use detected shell dialect (PowerShell vs bash differ — never emit bash for powershell target). No `rm -rf /`, no `diskpart/format/mkfs`, no curl-pipe-shell unless user explicitly asked, always set `done:true` with summary when task complete or impossible. Pure `cd` lines are handled locally (Sec 5), still return them as `command` with `run:true`.
+Rules in system prompt: single shell LINE per turn (pipes allowed, e.g. `ls -lh | sort -k5 -h`); avoid `&&`/`;` multi-step chains unless trivial — prefer one step per turn so output can be observed. Use detected shell dialect (PowerShell vs bash differ — never emit bash for powershell target). No `rm -rf /`, no `diskpart/format/mkfs`, no curl-pipe-shell unless user explicitly asked. done:true REQUIRES command null + run false; the engine tolerates violations (runs the command, then finishes) but the prompt must never emit them. `run:false` with a command means display-only, never execute. After a write/delete turn, done:true is forbidden until a later read-only turn has confirmed the result (engine enforces one verification turn as backstop).
 
-System prompt skeleton: role + shell dialect cheat-sheet + policy tiers + JSON-only + current context injected.
+System prompt skeleton: role + shell dialect cheat-sheet + policy tiers + JSON-only + current context injected. Full v2 text lives in `internal/llm/prompt.go` (OPERATING RULES 1-7 + few-shots); do not paraphrase it here.
+
+### 6.2 Per-turn user message (built by `llm.BuildUserMessage`)
+
+One self-contained message per turn (no stacked per-step pairs):
+
+```
+CONTEXT: shell=.. os=.. cwd=.. step=N/M
+ls: ...
+[recent shell history (only with --history)]
+TASK: <verbatim original task>
+STEPS (yours, oldest first):
+1. <cmd> -> exit <n>, <local digest: "N lines; first: ...">
+   note: <model's prior message, verbatim>
+[or "none yet"]
+LATEST OUTPUT (step N-1, exit N[, truncated]):
+<<<OUTPUT
+<8k... no: head 2500 + tail 1500 with omission marker, OUTPUT>>> neutralized>
+OUTPUT>>>
+NEXT: Reply with one JSON object. Original task again: "<task>". Does LATEST OUTPUT already answer it? Yes -> done:true with the values. No -> the single next command. [Your last command modified the system — verify it with a read-only command now (done:false).] [FINAL STEP: set done:true now.]
+```
+
+Rules: task repeated verbatim top AND bottom; STEPS carry local digests + prior notes only (never raw old outputs, never model-written summaries); only the latest output travels in full; `mustVerify` order appended when the previous turn executed a write/destructive command; `FINAL STEP` at N==M. Repair turn: same system + assistant echo of the bad reply (truncated 600) + user = `RepairPromptFor(concrete parser error)`; repair is never persisted to STEPS.
 
 ### 6.1 Streaming (required, v0.1)
 
@@ -177,7 +199,7 @@ Order: deny-regex → destructive-list → write-list → read-only. Name-only m
 - DENY (exit 2, never run even with --force unless explicit `argon --force --dry-run` review? No — deny stays deny): `sudo|doas|runas`, `| sh`, `| bash`, `curl *|*`, `wget *|*`, b64 decode+exec (`certutil -decode`, `FromBase64String`, `base64 -d`), `IEX|Invoke-Expression`, `Set-MpPreference|Disable.*Defender`, `reg delete|reg add HKLM`, `rd /s /q C:\Windows`, `format|diskpart|mkfs`, `:(){:|:&}`, `> /dev/sd*`, `chmod -R 777 /`, `chown -R /*`, `C:\Windows\System32` deletes, `~/.ssh/id_rsa` exfil (any `id_rsa|id_ed25519|.pem` piped to network or sent to LLM — redact).
 - READ auto-run: `ls,dir,pwd,echo,cat,type,ps,df,git status/diff/log,find,lsb_release,whoami` ONLY when no deny match and no write args (e.g. `cat > file` is WRITE, `find ... -delete` is DESTRUCTIVE).
 - WRITE needs Enter (`--yes` skips): `mkdir,New-Item,touch,cp,Copy-Item,mv,npm/pip/apt install,git add/commit`. Unknown commands default here.
-- DESTRUCTIVE double-confirm (locked): `rm -rf,Remove-Item -Recurse -Force,rm -r ~/.config,git push --force,git reset --hard,apt remove/purge,docker system prune`. Flow: show explanation + command + require typed `YES` + `--force` flag together. Never with `--yes` alone. Exit 2 otherwise.
+- DESTRUCTIVE double-confirm (locked): `rm -rf,Remove-Item -Recurse -Force,rm -r ~/.config,git push --force,git reset --hard,apt remove/purge,docker system prune`, plus wildcard deletes (`rm *.tmp`, `Remove-Item C:\Temp\*.tmp`, `Remove-Item` piped or with -Recurse). Flow: show explanation + command + require typed `YES` + `--force` flag together. Never with `--yes` alone. Exit 2 otherwise.
 - Secrets: redact in prompts, history, AND command outputs before LLM send via regex (`(?i)(api[_-]?key|token|passwd|secret|bearer|aws_.*)\s*[:=].*` → `[REDACTED]`). `risk/policy.go` + `risk/redact.go`, unit-tested.
 - PowerShell quoting: pass command via UTF-8 file or `-EncodedCommand` to avoid `$`/`"` interpolation bugs; log exact command string shown to user.
 

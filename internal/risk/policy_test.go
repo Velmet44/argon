@@ -20,6 +20,11 @@ func TestClassify(t *testing.T) {
 		{"Get-ChildItem C:\\Windows | Sort-Object Name", TierRead},
 		{"cat > file", TierWrite},
 		{"mystery-tool --frobnicate", TierWrite},
+		{"Remove-Item C:\\Temp\\*.tmp", TierDestr},
+		{"Get-ChildItem C:\\Temp | Remove-Item", TierDestr},
+		{"Remove-Item foo.txt", TierWrite},
+		{"rm *.tmp", TierDestr},
+		{"rm file.txt", TierWrite},
 	}
 	for _, c := range cases {
 		got, _ := Classify(c.cmd, nil, nil, disabled)
