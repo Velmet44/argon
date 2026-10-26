@@ -79,16 +79,24 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 
 	sessionCap := 0
 	for turn := 1; turn <= maxTurns; turn++ {
+		t0 := time.Now()
 		raw, err := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.SystemPrompt, llmTimeout, userCtx)
 		if err != nil {
-			return err
+			return fmt.Errorf("llm turn %d failed after %s: %v", turn, time.Since(t0).Round(time.Millisecond), err)
+		}
+		if cfg.UI.Verbose {
+			fmt.Println(dim(fmt.Sprintf("[turn %d llm %s raw %d bytes]", turn, time.Since(t0).Round(time.Millisecond), len(raw))))
+			fmt.Println(dim("raw: " + truncateRaw(raw, 2000)))
 		}
 		reply, err := llm.ParseReply(raw)
 		if err != nil {
-			// one repair retry
-			raw2, err2 := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.RepairPrompt+"\n\n"+raw, llmTimeout, "")
+			// one repair retry: system stays, user = repair instruction + bad output
+			raw2, err2 := llmTurn(cmd.Context(), baseURL, apiKey, model, llm.SystemPrompt, llmTimeout, llm.RepairPrompt+"\n\nBAD OUTPUT:\n"+raw)
 			if err2 != nil {
 				return fmt.Errorf("could not parse model JSON (use --verbose): %v", err)
+			}
+			if cfg.UI.Verbose {
+				fmt.Println(dim("repair raw: " + truncateRaw(raw2, 2000)))
 			}
 			reply, err = llm.ParseReply(raw2)
 			if err != nil {
@@ -165,18 +173,14 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 	ch := make(chan llm.Chunk, 64)
 	go llm.StreamChat(c, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user}, ch)
 	var sb strings.Builder
-	useColor := cfg.UI.Color
+	streamErr := error(nil)
 	for ck := range ch {
 		if ck.Err != nil {
-			// SSE fallback: single non-stream retry
-			c2, cancel2 := context.WithTimeout(ctx, timeout)
-			defer cancel2()
-			return llm.CompleteOnce(c2, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user, Timeout: timeout})
+			streamErr = ck.Err
+			break
 		}
 		sb.WriteString(ck.Text)
-		if useColor && !isTTY() {
-			// non-TTY: no live colors
-		} else if cfg.UI.Stream {
+		if cfg.UI.Stream && cfg.UI.Color && isTTY() {
 			fmt.Print(dim(ck.Text))
 		}
 		if ck.Done {
@@ -184,7 +188,34 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 		}
 	}
 	fmt.Println()
+	if streamErr != nil {
+		// SSE failed: single non-stream retry, surface combined error if it also fails
+		c2, cancel2 := context.WithTimeout(ctx, timeout)
+		defer cancel2()
+		raw, err := llm.CompleteOnce(c2, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user, Timeout: timeout})
+		if err != nil {
+			return "", fmt.Errorf("stream failed (%v) + retry failed (%v)", streamErr, err)
+		}
+		if cfg.UI.Verbose {
+			fmt.Println(dim(fmt.Sprintf("[stream fallback to non-stream after: %v]", streamErr)))
+		}
+		return raw, nil
+	}
+	if sb.Len() == 0 {
+		// empty stream (provider sent no deltas): one non-stream retry
+		c2, cancel2 := context.WithTimeout(ctx, timeout)
+		defer cancel2()
+		return llm.CompleteOnce(c2, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user, Timeout: timeout})
+	}
 	return sb.String(), nil
+}
+
+func truncateRaw(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func confirmEnter(msg string) bool {

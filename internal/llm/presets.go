@@ -16,7 +16,7 @@ func Presets() []Preset {
 		{"gemini", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", "gemini-2.0-flash"},
 		{"groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "llama-3.3-70b-versatile"},
 		{"openrouter", "https://api.openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openrouter/auto"},
-		{"nvidia", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", "meta/llama-3.3-70b-instruct"},
+		{"nvidia", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", "nvidia/llama-3.1-nemotron-70b-instruct"},
 		{"cerebras", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", "llama-3.3-70b"},
 		{"mistral", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", "mistral-small-latest"},
 		{"deepseek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"},
