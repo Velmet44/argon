@@ -1,0 +1,35 @@
+version: 2
+project_name: argon
+builds:
+  - main: ./cmd/argon
+    binary: argon
+    goos: [windows, linux, darwin]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: darwin
+        goarch: [amd64, arm64]
+    ldflags: [-s -w]
+    env: [CGO_ENABLED=0]
+archives:
+  - format_overrides:
+      - goos: windows
+        format: zip
+nfpms:
+  - package_name: argon
+    file_name_template: "{{ .PackageName }}_{{ .Version }}_{{ .Arch }}"
+    builds: [default]
+    formats: [deb, rpm]
+    maintainer: Velmet44
+    description: Argon — natural-language shell
+checksum:
+  name_template: checksums.txt
+release:
+  github:
+    owner: Velmet44
+    name: argon
+winget:
+  - package_identifier: Velmet44.Argon
+    publisher: Velmet44
+    publisher_url: https://github.com/Velmet44/argon
+    short_description: Natural-language shell
+    license: MIT

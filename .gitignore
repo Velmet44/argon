@@ -1,0 +1,17 @@
+# Binaries
+argon
+argon.exe
+dist/
+# Go
+*.test
+*.out
+vendor/
+# Config / local
+.argon/
+# OS
+.DS_Store
+Thumbs.db
+# Editor
+.vscode/
+.idea/
+*.swp

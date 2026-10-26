@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build -o argon${{ matrix.os == 'windows-latest' && '.exe' || '' }} ./cmd/argon
+      - run: ./argon${{ matrix.os == 'windows-latest' && '.exe' || '' }} version && ./argon${{ matrix.os == 'windows-latest' && '.exe' || '' }} "demo" --dry-run || true
