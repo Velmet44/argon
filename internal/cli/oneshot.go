@@ -12,6 +12,7 @@ import (
 	"github.com/Velmet44/argon/internal/execx"
 	"github.com/Velmet44/argon/internal/llm"
 	"github.com/Velmet44/argon/internal/risk"
+	"github.com/Velmet44/argon/internal/tui"
 	"github.com/Velmet44/argon/internal/xcontext"
 )
 
@@ -43,6 +44,11 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 	var hist []string
 	if useHist {
 		hist = xcontext.ReadHistory(limit)
+	}
+	// TTY gets the fullscreen runner (mouse, collapsible thoughts, color
+	// system). Pipes keep the plain streaming printer below.
+	if isTTY() {
+		return tui.RunOneShotTUI(cfg, ci.OS, shell, ci.CWD, ci.LsTop, hist, prompt, dryRun, yes, force)
 	}
 	fmt.Printf("◈ argon (%s/%s) %s\n", ci.OS, shell, dim(fmt.Sprintf("+history(%d)", len(hist))))
 

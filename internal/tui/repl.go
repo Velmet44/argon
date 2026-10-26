@@ -835,7 +835,7 @@ func (m *replModel) finishPrompt(cmds []string, exit int) {
 	m.m = modeInput
 	m.status = ""
 	m.input.Focus()
-	appendReplHistory(m.prompt, cmds, exit)
+	appendHistoryTUI("repl", m.prompt, cmds, exit)
 }
 
 func (m *replModel) View() string {
@@ -935,7 +935,7 @@ func joinBaseTUI(base, target string) string {
 	return filepath.Clean(filepath.Join(base, target))
 }
 
-func appendReplHistory(prompt string, cmds []string, exit int) {
+func appendHistoryTUI(mode, prompt string, cmds []string, exit int) {
 	d, err := config.Dir()
 	if err != nil {
 		return
@@ -946,7 +946,7 @@ func appendReplHistory(prompt string, cmds []string, exit int) {
 		return
 	}
 	defer f.Close()
-	e := map[string]any{"mode": "repl", "prompt": prompt, "commands": cmds, "exit": exit}
+	e := map[string]any{"mode": mode, "prompt": prompt, "commands": cmds, "exit": exit}
 	b, _ := json.Marshal(e)
 	_, _ = f.Write(append(b, '\n'))
 }
