@@ -145,7 +145,8 @@ func runOneShot(cmd *cobra.Command, args []string) error {
 				return appendHistory("oneshot", prompt, []string{command}, 2)
 			}
 		case risk.TierWrite:
-			if !dryRun && !yes && !confirmEnter("run? [Enter=yes Ctrl+C=no] ") {
+			if !dryRun && !yes && !confirmEnter("run? [Enter/y=yes, n=no] ") {
+				fmt.Println("aborted — rerun with --yes to skip prompts, or answer y/Enter to run.")
 				return appendHistory("oneshot", prompt, []string{command}, 1)
 			}
 		}
@@ -186,20 +187,28 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 	go llm.StreamChat(c, llm.TurnRequest{BaseURL: baseURL, APIKey: key, Model: model, System: system, User: user}, ch)
 	var sb strings.Builder
 	streamErr := error(nil)
+	showRaw := cfg.UI.Verbose && cfg.UI.Color && isTTY()
+	if !cfg.UI.Verbose {
+		fmt.Print(dim("thinking…"))
+	}
 	for ck := range ch {
 		if ck.Err != nil {
 			streamErr = ck.Err
 			break
 		}
 		sb.WriteString(ck.Text)
-		if cfg.UI.Stream && cfg.UI.Color && isTTY() {
+		if showRaw {
 			fmt.Print(dim(ck.Text))
 		}
 		if ck.Done {
 			break
 		}
 	}
-	fmt.Println()
+	if !cfg.UI.Verbose {
+		fmt.Print("\r" + strings.Repeat(" ", 12) + "\r")
+	} else {
+		fmt.Println()
+	}
 	if streamErr != nil {
 		// SSE failed: single non-stream retry, surface combined error if it also fails
 		c2, cancel2 := context.WithTimeout(ctx, timeout)
@@ -237,7 +246,8 @@ func confirmEnter(msg string) bool {
 	fmt.Print(msg)
 	r := bufio.NewReader(os.Stdin)
 	s, _ := r.ReadString('\n')
-	return strings.TrimSpace(s) == ""
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "" || s == "y" || s == "yes"
 }
 
 func confirmYES(msg string) bool {

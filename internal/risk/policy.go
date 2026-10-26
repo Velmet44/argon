@@ -53,7 +53,7 @@ func DefaultRules() []Rule {
 		{ID: "destr-pkg-remove", Tier: TierDestr, Re: must(`apt\s+(remove|purge)|pip\s+uninstall\s+-y|npm\s+uninstall\s+-g|docker\s+system\s+prune`), Reason: "package/data removal"},
 		{ID: "destr-rm-config", Tier: TierDestr, Re: must(`rm\s+-r\s+~\/\.(config|local|ssh)`), Reason: "dot-config wipe"},
 		// ---- READ: explicit safe only (args that write are re-checked in Classify) ----
-		{ID: "read-ls", Tier: TierRead, Re: must(`^\s*(ls|dir|pwd|whoami|lsb_release|df|ps|echo|type|cat|find)\b`), Reason: "read-only probe"},
+		{ID: "read-ls", Tier: TierRead, Re: must(`^\s*(ls|dir|pwd|whoami|lsb_release|df|ps|echo|write-output|write-host|type|cat|find|get-psdrive|get-childitem|get-content|get-location|get-date|get-process|get-service|select-object|where-object|sort-object|format-table|format-list|measure-object)\b`), Reason: "read-only probe"},
 	}
 }
 

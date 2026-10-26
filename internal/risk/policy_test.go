@@ -16,6 +16,9 @@ func TestClassify(t *testing.T) {
 		{"Remove-Item -Recurse -Force foo", TierDestr},
 		{"git push --force", TierDestr},
 		{"mkdir foo", TierWrite},
+		{"Get-PSDrive -PSProvider FileSystem | Select-Object Name, Free", TierRead},
+		{"Get-ChildItem C:\\Windows | Sort-Object Name", TierRead},
+		{"cat > file", TierWrite},
 		{"mystery-tool --frobnicate", TierWrite},
 	}
 	for _, c := range cases {
