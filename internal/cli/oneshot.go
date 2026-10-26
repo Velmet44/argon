@@ -189,7 +189,7 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 	streamErr := error(nil)
 	showRaw := cfg.UI.Verbose && cfg.UI.Color && isTTY()
 	if !cfg.UI.Verbose {
-		fmt.Print(dim("thinking…"))
+		fmt.Println(dim("thinking…"))
 	}
 	for ck := range ch {
 		if ck.Err != nil {
@@ -205,7 +205,7 @@ func llmTurn(ctx context.Context, baseURL, key, model, system string, timeout ti
 		}
 	}
 	if !cfg.UI.Verbose {
-		fmt.Print("\r" + strings.Repeat(" ", 12) + "\r")
+		// thinking… already ended with newline; nothing to clear.
 	} else {
 		fmt.Println()
 	}
