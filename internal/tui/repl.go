@@ -61,9 +61,9 @@ type replModel struct {
 	input textinput.Model
 	ready bool
 
-	lines    []string // styled transcript
-	streamed string   // live raw stream buffer (shown dim, replaced on DONE)
-	status   string
+	blocks []*rBlock // styled transcript (blank line between blocks)
+	status string
+	stick  bool // follow tail on render (cleared when user scrolls up)
 
 	m mode
 
@@ -77,6 +77,7 @@ type replModel struct {
 	pendingDone bool
 	pendingMsg  string
 	sess      []sessTurn
+	curOut    *rBlock // live command output block
 
 	inputHist []string
 	histIdx   int
@@ -87,14 +88,21 @@ type replModel struct {
 	width, height int
 }
 
+type tickMsg struct{}
+
+func (m *replModel) tick() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
 func RunREPL(cfg config.Config, osStr, shell, cwd string, lsTop, histFile []string, force bool) error {
 	m := &replModel{
 		cfg: cfg, force: force, osStr: osStr, shell: shell, cwd: cwd,
 		lsTop: lsTop, histFile: histFile, m: modeInput, histIdx: -1,
+		stick: true,
 	}
-	m.lines = append(m.lines, styleHeader(cfg.UI.Color,
-		fmt.Sprintf("argon REPL — %s/%s — %s — type English, /help for commands", osStr, shell, cwd)))
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	m.blocks = append(m.blocks, &rBlock{kind: rHead, text:
+		fmt.Sprintf("argon REPL — %s/%s — %s — type English, /help for commands", osStr, shell, cwd)})
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	m.prog = p
 	_, err := p.Run()
 	return err
@@ -118,12 +126,130 @@ func historyBadge(m *replModel) string {
 }
 
 func (m *replModel) render() {
-	body := strings.Join(m.lines, "\n")
-	if m.streamed != "" {
-		body += "\n" + styleDim(m.cfg.UI.Color, m.streamed)
+	if !m.ready {
+		return
 	}
-	m.vp.SetContent(body)
-	m.vp.GotoBottom()
+	width := m.vp.Width
+	if width <= 0 {
+		width = m.width
+	}
+	var sb strings.Builder
+	for i, b := range m.blocks {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		for _, l := range b.render(m.cfg.UI.Color, width) {
+			sb.WriteString(l + "\n")
+		}
+	}
+	m.vp.SetContent(strings.TrimSuffix(sb.String(), "\n"))
+	if m.stick {
+		m.vp.GotoBottom()
+	}
+}
+
+// --- transcript append helpers (all set stick so new content is followed) ---
+
+func (m *replModel) add(b *rBlock) {
+	m.blocks = append(m.blocks, b)
+	m.stick = true
+}
+
+func (m *replModel) addEcho(text string)  { m.add(&rBlock{kind: rEcho, text: text}) }
+func (m *replModel) addHead(text string)  { m.add(&rBlock{kind: rHead, text: text}) }
+func (m *replModel) addMeta(text string)  { m.add(&rBlock{kind: rMeta, text: text}) }
+func (m *replModel) addMsg(text string)   { m.add(&rBlock{kind: rMsg, text: text}) }
+func (m *replModel) addErr(text string)   { m.add(&rBlock{kind: rErr, text: text}) }
+func (m *replModel) addCmd(cmd, tier string) { m.add(&rBlock{kind: rCmd, cmd: cmd, tier: tier}) }
+
+func (m *replModel) addThought() *ThoughtBlock {
+	th := &ThoughtBlock{StartedAt: time.Now(), Expanded: m.cfg.UI.Verbose}
+	th.Hovered = false
+	m.add(&rBlock{kind: rThought, thought: th})
+	return th
+}
+
+func (m *replModel) addOut() *rBlock {
+	b := &rBlock{kind: rOut}
+	m.add(b)
+	m.curOut = b
+	return b
+}
+
+// finishActiveThought freezes the live Thinking… block (sets elapsed; text
+// arrives in handleLLMDone).
+func (m *replModel) finishActiveThought() {
+	for i := len(m.blocks) - 1; i >= 0; i-- {
+		if b := m.blocks[i]; b.kind == rThought && !b.thought.Done {
+			b.thought.Done = true
+			b.thought.Elapsed = time.Since(b.thought.StartedAt)
+			return
+		}
+	}
+}
+
+// toggleLastCollapsibleBlock flips the newest thought/output block (F2).
+func (m *replModel) toggleLastCollapsibleBlock() bool {
+	if toggleLastCollapsible(m.blocks) {
+		m.render()
+		return true
+	}
+	return false
+}
+
+// mouse hit-testing: header occupies 2 rows (title + blank).
+func (m *replModel) blockAt(y int) *rBlock {
+	contentY := y - 2
+	if contentY < 0 || contentY >= m.vp.Height {
+		return nil
+	}
+	spans, total := blockSpans(m.blocks, m.cfg.UI.Color, m.vp.Width)
+	idx := findBlock(spans, total, m.vp.YOffset+contentY)
+	if idx < 0 {
+		return nil
+	}
+	return m.blocks[idx]
+}
+
+func (m *replModel) handleMouse(msg tea.MouseMsg) {
+	switch msg.Action {
+	case tea.MouseActionMotion:
+		b := m.blockAt(msg.Y)
+		was := clearHover(m.blocks)
+		if b != nil {
+			if isThoughtBlock(b) {
+				b.thought.Hovered = true
+				m.render()
+				return
+			}
+			if isOutBlock(b) && len(b.out) > outPreview && !b.outOpen {
+				b.outHover = true
+				m.render()
+				return
+			}
+		}
+		if was {
+			m.render()
+		}
+	case tea.MouseActionPress:
+		if msg.Button != tea.MouseButtonLeft {
+			return
+		}
+		if b := m.blockAt(msg.Y); b != nil {
+			if isThoughtBlock(b) {
+				b.thought.Expanded = !b.thought.Expanded
+				m.render()
+			} else if isOutBlock(b) && len(b.out) > outPreview {
+				b.outOpen = !b.outOpen
+				m.render()
+			}
+		}
+	default:
+		// wheel + anything else: viewport scrolls, stop following tail.
+		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			m.stick = false
+		}
+	}
 }
 
 func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -137,23 +263,26 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Width = msg.Width - 4
 			m.input.Focus()
 			m.vp = viewport.New(msg.Width, msg.Height-5)
-			m.vp.SetContent(strings.Join(m.lines, "\n"))
 			m.ready = true
+			m.render()
 		} else {
 			m.vp.Width = msg.Width
 			m.vp.Height = msg.Height - 5
 			m.input.Width = msg.Width - 4
+			m.render()
+		}
+		return m, nil
+
+	case tickMsg:
+		if m.m == modeStreaming || m.m == modeRunning {
+			m.render()
+			return m, m.tick()
 		}
 		return m, nil
 
 	case chunkMsg:
 		if m.m == modeStreaming {
 			m.raw += msg.text
-			m.streamed += msg.text
-			if len(m.streamed) > 4000 {
-				m.streamed = m.streamed[len(m.streamed)-4000:]
-			}
-			m.render()
 		}
 		return m, nil
 
@@ -161,25 +290,38 @@ func (m *replModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.m != modeStreaming {
 			return m, nil
 		}
-		m.streamed = ""
+		m.finishActiveThought()
 		m.handleLLMDone(msg.raw)
 		return m, nil
 
 	case errMsg:
-		m.streamed = ""
-		m.lines = append(m.lines, styleErr(m.cfg.UI.Color, "llm error: "+msg.err.Error()))
+		m.finishActiveThought()
+		m.addErr("llm error: " + msg.err.Error())
 		m.m = modeInput
 		m.input.Focus()
 		m.render()
 		return m, nil
 
 	case execLineMsg:
-		m.lines = append(m.lines, msg.line)
-		m.render()
+		if m.curOut != nil {
+			m.curOut.out = append(m.curOut.out, msg.line)
+			m.stick = true
+			m.render()
+		}
 		return m, nil
 
 	case execDoneMsg:
 		m.handleExecDone(msg)
+		return m, nil
+
+	case tea.MouseMsg:
+		m.handleMouse(msg)
+		// let the viewport also see wheel events for scrolling
+		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			var c tea.Cmd
+			m.vp, c = m.vp.Update(msg)
+			return m, c
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -204,8 +346,8 @@ func (m *replModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.cancel != nil {
 				m.cancel()
 			}
-			m.streamed = ""
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(cancelled)"))
+			m.finishActiveThought()
+			m.addMeta("(cancelled)")
 			m.m = modeInput
 			m.input.Focus()
 			m.render()
@@ -220,13 +362,16 @@ func (m *replModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case tea.KeyEsc:
 		if m.m == modeConfirmWrite {
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(aborted)"))
+			m.addMeta("(aborted)")
 			m.m = modeInput
 			m.pending = ""
 			m.input.Focus()
 			m.render()
 			return m, nil
 		}
+		return m, nil
+	case tea.KeyF2:
+		m.toggleLastCollapsibleBlock()
 		return m, nil
 	case tea.KeyEnter:
 		if m.m == modeConfirmWrite {
@@ -245,7 +390,7 @@ func (m *replModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if val == "YES" {
 				m.runPending()
 			} else {
-				m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(aborted — type YES to confirm destructive)"))
+				m.addMeta("(aborted — type YES to confirm destructive)")
 				m.m = modeInput
 				m.pending = ""
 				m.input.Focus()
@@ -300,7 +445,7 @@ func (m *replModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if r == "n" || r == "N" {
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(aborted)"))
+			m.addMeta("(aborted)")
 			m.m = modeInput
 			m.pending = ""
 			m.input.Focus()
@@ -335,7 +480,7 @@ func (m *replModel) complete() {
 		if len(hits) == 1 {
 			m.input.SetValue(hits[0] + " ")
 		} else if len(hits) > 1 {
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, strings.Join(hits, "  ")))
+			m.addMeta(strings.Join(hits, "  "))
 			m.render()
 		}
 		return
@@ -358,7 +503,7 @@ func (m *replModel) complete() {
 	if len(hits) == 1 {
 		m.input.SetValue(v + hits[0][len(tail):])
 	} else if len(hits) > 1 {
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, strings.Join(hits, "  ")))
+		m.addMeta(strings.Join(hits, "  "))
 		m.render()
 	}
 }
@@ -367,7 +512,8 @@ var slashHelp = `/help — this help
 /clear — clear view + session turns (file history kept if on)
 /shell [x] · /model [x] · /provider [x] — show or set
 /verbose · /dry-run [on|off] · /stream [on|off] · /history [on|off] · /force [on|off]
-/settings — opens external settings (Stage 4 ships in-TUI editor)
+/settings — full settings (same as: argon settings)
+click a thought/output to expand · F2 toggles last block
 /quit — exit (Ctrl+D, Ctrl+C on empty line)`
 
 func (m *replModel) handleSlash(val string) {
@@ -379,36 +525,36 @@ func (m *replModel) handleSlash(val string) {
 	}
 	switch cmd {
 	case "/help", "/h", "/?":
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, slashHelp))
+		m.addMeta(slashHelp)
 	case "/quit", "/exit", "/q":
 		if m.prog != nil {
 			// quit asynchronously to avoid deadlock inside Update
 			go m.prog.Quit()
 		}
 	case "/clear":
-		m.lines = nil
+		m.blocks = nil
 		m.sess = nil
 		m.turn = 0
-		m.streamed, m.raw, m.pending = "", "", ""
+		m.raw, m.pending, m.curOut = "", "", nil
 		m.m = modeInput
-		m.lines = append(m.lines, styleHeader(m.cfg.UI.Color, "cleared."))
+		m.addHead("cleared.")
 	case "/shell":
 		if arg == "" {
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "shell="+m.shell))
+			m.addMeta("shell=" + m.shell)
 		} else {
 			m.shell = strings.ToLower(arg)
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "shell → "+m.shell))
+			m.addMeta("shell → " + m.shell)
 		}
 	case "/model":
 		if arg == "" {
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "model="+m.cfg.LLM.Model))
+			m.addMeta("model=" + m.cfg.LLM.Model)
 		} else {
 			m.cfg.LLM.Model = arg
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "model → "+arg))
+			m.addMeta("model → " + arg)
 		}
 	case "/provider":
 		if arg == "" {
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "provider="+m.cfg.LLM.Preset))
+			m.addMeta("provider=" + m.cfg.LLM.Preset)
 		} else {
 			old := llm.Lookup(m.cfg.LLM.Preset)
 			m.cfg.LLM.Preset = strings.ToLower(arg)
@@ -419,11 +565,11 @@ func (m *replModel) handleSlash(val string) {
 			if m.cfg.LLM.Model == "" || m.cfg.LLM.Model == old.Model {
 				m.cfg.LLM.Model = nw.Model
 			}
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "provider → "+m.cfg.LLM.Preset))
+			m.addMeta("provider → " + m.cfg.LLM.Preset)
 		}
 	case "/verbose":
 		m.cfg.UI.Verbose = !m.cfg.UI.Verbose
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, fmt.Sprintf("verbose=%v", m.cfg.UI.Verbose)))
+		m.addMeta(fmt.Sprintf("verbose=%v", m.cfg.UI.Verbose))
 	case "/dry-run", "/dryrun":
 		m.cfg.Defaults.ConfirmWrite = true
 		if strings.ToLower(arg) == "off" {
@@ -433,7 +579,7 @@ func (m *replModel) handleSlash(val string) {
 		} else {
 			setDryRun(m, !dryRunOn(m))
 		}
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, fmt.Sprintf("dry-run=%v", dryRunOn(m))))
+		m.addMeta(fmt.Sprintf("dry-run=%v", dryRunOn(m)))
 	case "/stream":
 		if strings.ToLower(arg) == "off" {
 			m.cfg.UI.Stream = false
@@ -442,7 +588,7 @@ func (m *replModel) handleSlash(val string) {
 		} else {
 			m.cfg.UI.Stream = !m.cfg.UI.Stream
 		}
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, fmt.Sprintf("stream=%v", m.cfg.UI.Stream)))
+		m.addMeta(fmt.Sprintf("stream=%v", m.cfg.UI.Stream))
 	case "/history":
 		if strings.ToLower(arg) == "off" {
 			m.cfg.Defaults.History = false
@@ -451,7 +597,7 @@ func (m *replModel) handleSlash(val string) {
 		} else {
 			m.cfg.Defaults.History = !m.cfg.Defaults.History
 		}
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, fmt.Sprintf("history=%v", m.cfg.Defaults.History)))
+		m.addMeta(fmt.Sprintf("history=%v", m.cfg.Defaults.History))
 	case "/force":
 		if strings.ToLower(arg) == "off" {
 			m.force = false
@@ -460,11 +606,11 @@ func (m *replModel) handleSlash(val string) {
 		} else {
 			m.force = !m.force
 		}
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, fmt.Sprintf("force=%v (destructive still needs YES)", m.force)))
+		m.addMeta(fmt.Sprintf("force=%v (destructive still needs YES)", m.force))
 	case "/settings":
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "run `argon settings` outside REPL (in-TUI editor ships Stage 4)"))
+		m.addMeta("full settings live in `argon settings` (external TUI)")
 	default:
-		m.lines = append(m.lines, styleErr(m.cfg.UI.Color, "unknown command: "+cmd+" (try /help)"))
+		m.addErr("unknown command: " + cmd + " (try /help)")
 	}
 }
 
@@ -483,7 +629,8 @@ func (m *replModel) startPrompt(p string) {
 	m.prompt = p
 	m.turn = 0
 	m.pendingDone, m.pendingMsg = false, ""
-	m.lines = append(m.lines, styleHeader(m.cfg.UI.Color, "you: "+p))
+	m.curOut = nil
+	m.addEcho(p)
 	m.startLLMTurn(m.buildUserCtx(p, ""))
 }
 
@@ -525,13 +672,17 @@ func (m *replModel) startLLMTurn(userCtx string) {
 	m.userCtx = userCtx
 	m.m = modeStreaming
 	m.raw = ""
-	m.streamed = ""
+	m.curOut = nil
+	th := &ThoughtBlock{StartedAt: time.Now(), Expanded: m.cfg.UI.Verbose}
+	m.add(&rBlock{kind: rThought, thought: th})
+	m.render()
 	baseURL, model, key, preset := m.llmReq()
 	if key == "" {
-		m.lines = append(m.lines, styleErr(m.cfg.UI.Color,
-			fmt.Sprintf("no API key — get a free Groq key at %s, then `argon settings` (or set %s)", llm.GroqKeyURL, preset.KeyEnv)))
+		th.Done, th.Elapsed, th.Text = true, 0, "(no key)"
+		m.addErr(fmt.Sprintf("no API key — get a free Groq key at %s, then `argon settings` (or set %s)", llm.GroqKeyURL, preset.KeyEnv))
 		m.m = modeInput
 		m.input.Focus()
+		m.render()
 		return
 	}
 	m.status = fmt.Sprintf("turn %d…", m.turn+1)
@@ -541,6 +692,9 @@ func (m *replModel) startLLMTurn(userCtx string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
 	m.cancel = cancel
+	if m.prog != nil {
+		m.prog.Send(tickMsg{}) // kick live Thinking… counter
+	}
 	p := m.prog
 	sys := llm.SystemPrompt
 	go func() {
@@ -593,7 +747,17 @@ func (m *replModel) startLLMTurn(userCtx string) {
 
 func (m *replModel) handleLLMDone(raw string) {
 	if m.cfg.UI.Verbose {
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "raw("+fmt.Sprint(len(raw))+"b)"))
+		m.addMeta("raw(" + fmt.Sprint(len(raw)) + "b)")
+	}
+	// freeze the live thought block first; text is set below on success
+	th := m.activeThought()
+	freeze := func(text string, expanded bool) {
+		if th != nil {
+			th.Done = true
+			th.Elapsed = time.Since(th.StartedAt)
+			th.Text = text
+			th.Expanded = expanded
+		}
 	}
 	reply, err := llm.ParseReply(raw)
 	if err != nil {
@@ -606,7 +770,8 @@ func (m *replModel) handleLLMDone(raw string) {
 			User:    llm.RepairPrompt + "\n\nBAD OUTPUT:\n" + raw,
 			Timeout: 60 * time.Second})
 		if err2 != nil {
-			m.lines = append(m.lines, styleErr(m.cfg.UI.Color, "could not parse model JSON: "+err.Error()))
+			freeze("(parse failed)", false)
+			m.addErr("could not parse model JSON: " + err.Error())
 			m.m = modeInput
 			m.input.Focus()
 			m.render()
@@ -615,18 +780,19 @@ func (m *replModel) handleLLMDone(raw string) {
 		var err3 error
 		reply, err3 = llm.ParseReply(raw2)
 		if err3 != nil {
-			m.lines = append(m.lines, styleErr(m.cfg.UI.Color, "could not parse model JSON: "+err3.Error()))
+			freeze("(parse failed)", false)
+			m.addErr("could not parse model JSON: " + err3.Error())
 			m.m = modeInput
 			m.input.Focus()
 			m.render()
 			return
 		}
 	}
-	if reply.Thought != "" {
-		m.lines = append(m.lines, styleArgon(m.cfg.UI.Color, reply.Thought))
-	}
+	freeze(reply.Thought, m.cfg.UI.Verbose)
 	if reply.Command == nil || strings.TrimSpace(*reply.Command) == "" {
-		m.lines = append(m.lines, reply.Message)
+		if strings.TrimSpace(reply.Message) != "" {
+			m.addMsg(reply.Message)
+		}
 		m.finishPrompt(nil, 0)
 		m.render()
 		return
@@ -636,11 +802,14 @@ func (m *replModel) handleLLMDone(raw string) {
 	command := strings.TrimSpace(*reply.Command)
 	if execx.IsPureCD(command) {
 		m.cwd = tuiResolveCD(m.cwd, command)
-		m.lines = append(m.lines, styleCmd(m.cfg.UI.Color, command+"  (cwd → "+m.cwd+")"))
+		m.addCmd(command, "cd")
+		m.addMeta("cwd → " + m.cwd)
 		m.userCtx = fmt.Sprintf("(cd → %s)\n%s", m.cwd, m.userCtx)
 		m.render()
 		if doneFirst {
-			m.lines = append(m.lines, reply.Message)
+			if strings.TrimSpace(reply.Message) != "" {
+				m.addMsg(reply.Message)
+			}
 			m.finishPrompt([]string{command}, 0)
 			m.m = modeInput
 			m.input.Focus()
@@ -651,43 +820,43 @@ func (m *replModel) handleLLMDone(raw string) {
 		return
 	}
 	tier, why := risk.Classify(command, m.cfg.Risk.ExtraDeny, m.cfg.Risk.ExtraDestructive, disabledSet(m.cfg.Risk.Disabled))
-	m.lines = append(m.lines, styleCmd(m.cfg.UI.Color, command)+styleDim(m.cfg.UI.Color, fmt.Sprintf("  [%s]", tier)))
+	m.addCmd(command, string(tier))
 	if m.cfg.UI.Verbose {
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "policy: "+why))
+		m.addMeta("policy: " + why)
 	}
 	switch tier {
 	case risk.TierDeny:
-		m.lines = append(m.lines, styleErr(m.cfg.UI.Color, "blocked: "+why))
+		m.addErr("blocked: " + why)
 		m.finishPrompt([]string{command}, 2)
 		m.m = modeInput
 		m.input.Focus()
 	case risk.TierDestr:
 		if !m.force {
-			m.lines = append(m.lines, styleErr(m.cfg.UI.Color, "destructive needs startup --force (or /force on) + typed YES. Aborted: "+why))
+			m.addErr("destructive needs startup --force (or /force on) + typed YES. Aborted: " + why)
 			m.finishPrompt([]string{command}, 2)
 			m.m = modeInput
 			m.input.Focus()
 			break
 		}
 		m.pending, m.pendingWhy = command, why
-		m.lines = append(m.lines, styleErr(m.cfg.UI.Color, "destructive — type YES + Enter to run"))
+		m.addErr("destructive — type YES + Enter to run")
 		m.m = modeConfirmDestr
 		m.input.Focus()
 	case risk.TierWrite:
 		if dryRunOn(m) {
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(dry-run, not executed)"))
+			m.addMeta("(dry-run — not executed)")
 			m.finishPrompt([]string{command}, 0)
 			m.m = modeInput
 			m.input.Focus()
 			break
 		}
 		m.pending, m.pendingWhy = command, why
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "run? [Enter=y / n]"))
+		m.addMeta("run? [Enter=y / n]")
 		m.m = modeConfirmWrite
 		m.input.Blur()
 	default: // read
 		if dryRunOn(m) {
-			m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(dry-run, not executed)"))
+			m.addMeta("(dry-run — not executed)")
 			m.finishPrompt([]string{command}, 0)
 			m.m = modeInput
 			m.input.Focus()
@@ -697,6 +866,16 @@ func (m *replModel) handleLLMDone(raw string) {
 		m.runPending()
 	}
 	m.render()
+}
+
+// activeThought returns the newest unfinished thought block, if any.
+func (m *replModel) activeThought() *ThoughtBlock {
+	for i := len(m.blocks) - 1; i >= 0; i-- {
+		if b := m.blocks[i]; b.kind == rThought && !b.thought.Done {
+			return b.thought
+		}
+	}
+	return nil
 }
 
 func (m *replModel) runPending() {
@@ -710,8 +889,12 @@ func (m *replModel) runPending() {
 	}
 	m.m = modeRunning
 	m.input.Blur()
-	m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "running…"))
+	m.addMeta("running…")
+	m.addOut()
 	m.render()
+	if m.prog != nil {
+		m.prog.Send(tickMsg{}) // keep live views animating during exec
+	}
 	execTimeout := time.Duration(m.cfg.Defaults.ExecTimeoutSec) * time.Second
 	if execTimeout <= 0 {
 		execTimeout = 60 * time.Second
@@ -730,20 +913,18 @@ func (m *replModel) runPending() {
 }
 
 func (m *replModel) handleExecDone(msg execDoneMsg) {
-	m.lines = append(m.lines, styleDim(m.cfg.UI.Color, fmt.Sprintf("(exit %d)", msg.res.ExitCode)))
+	m.addMeta(fmt.Sprintf("(exit %d)", msg.res.ExitCode))
 	m.render()
 	redacted := risk.Redact(msg.res.Output)
-	// append output tail to transcript (already streamed live line-by-line;
-	// if output was huge, execx truncated to 8k — show nothing extra)
-	_ = redacted
 	m.sess = append(m.sess, sessTurn{Prompt: m.prompt, Commands: []string{msg.command}, Exit: msg.res.ExitCode})
 	if len(m.sess) > 20 {
 		m.sess = m.sess[len(m.sess)-20:]
 	}
+	m.curOut = nil
 	if m.pendingDone {
 		m.pendingDone = false
-		if m.pendingMsg != "" {
-			m.lines = append(m.lines, m.pendingMsg)
+		if strings.TrimSpace(m.pendingMsg) != "" {
+			m.addMsg(m.pendingMsg)
 		}
 		m.finishPrompt([]string{msg.command}, msg.res.ExitCode)
 		m.m = modeInput
@@ -753,7 +934,7 @@ func (m *replModel) handleExecDone(msg execDoneMsg) {
 	}
 	m.turn++
 	if m.turn >= m.cfg.Defaults.MaxTurns {
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(max-turns reached)"))
+		m.addMeta("(max-turns reached)")
 		m.finishPrompt([]string{msg.command}, msg.res.ExitCode)
 		m.m = modeInput
 		m.input.Focus()
@@ -769,13 +950,17 @@ func (m *replModel) handleExecDone(msg execDoneMsg) {
 func (m *replModel) startLLMTurnContinue() {
 	// continue same prompt lifecycle (turn already incremented)
 	m.raw = ""
-	m.streamed = ""
+	m.curOut = nil
+	th := &ThoughtBlock{StartedAt: time.Now(), Expanded: m.cfg.UI.Verbose}
+	m.add(&rBlock{kind: rThought, thought: th})
+	m.render()
 	baseURL, model, key, _ := m.llmReq()
 	if key == "" {
-		m.lines = append(m.lines, styleErr(m.cfg.UI.Color,
-			"no API key — get a free Groq key at "+llm.GroqKeyURL+", then `argon settings`"))
+		th.Done, th.Elapsed, th.Text = true, 0, "(no key)"
+		m.addErr("no API key — get a free Groq key at " + llm.GroqKeyURL + ", then `argon settings`")
 		m.m = modeInput
 		m.input.Focus()
+		m.render()
 		return
 	}
 	m.status = fmt.Sprintf("turn %d…", m.turn+1)
@@ -785,6 +970,9 @@ func (m *replModel) startLLMTurnContinue() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
 	m.cancel = cancel
+	if m.prog != nil {
+		m.prog.Send(tickMsg{}) // kick live Thinking… counter
+	}
 	p := m.prog
 	sys, userCtx := llm.SystemPrompt, m.userCtx
 	go func() {
@@ -820,7 +1008,7 @@ func (m *replModel) startLLMTurnContinue() {
 func (m *replModel) nextTurn(note string) {
 	m.turn++
 	if m.turn >= m.cfg.Defaults.MaxTurns {
-		m.lines = append(m.lines, styleDim(m.cfg.UI.Color, "(max-turns reached)"))
+		m.addMeta("(max-turns reached)")
 		m.finishPrompt(nil, 0)
 		m.m = modeInput
 		m.input.Focus()
@@ -860,6 +1048,8 @@ func (m *replModel) View() string {
 		b.WriteString(styleDim(m.cfg.UI.Color, m.status))
 	} else if dryRunOn(m) {
 		b.WriteString(styleDim(m.cfg.UI.Color, "dry-run"))
+	} else {
+		b.WriteString(styleDim(m.cfg.UI.Color, "click a thought/output to expand · F2 toggles last"))
 	}
 	return b.String()
 }
